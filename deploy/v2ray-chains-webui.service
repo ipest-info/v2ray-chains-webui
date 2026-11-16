@@ -1,0 +1,15 @@
+[Unit]
+Description=v2ray-chains-webui
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/v2ray-chains-webui
+# 首次启动时用于初始化管理员账号，初始化完成后可删除这两行
+Environment=ADMIN_USER=admin
+Environment=ADMIN_PASSWORD=请改成至少8位的强密码
+ExecStart=/opt/v2ray-chains-webui/v2ray-chains-webui -listen :8080 -data /opt/v2ray-chains-webui/data
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

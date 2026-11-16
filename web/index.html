@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V2Ray 线路管理</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card">
+    <h1>V2Ray 线路管理</h1>
+    <label>管理员账号<input name="username" autocomplete="username" required autofocus></label>
+    <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+    <p class="err" id="loginErr"></p>
+    <button class="primary" type="submit">登录</button>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <strong>V2Ray 线路管理</strong>
+    <nav id="tabs">
+      <a data-tab="nodes" class="active">节点</a>
+      <a data-tab="chains">线路</a>
+      <a data-tab="users">用户</a>
+      <a data-tab="tasks">任务日志</a>
+      <a data-tab="settings">设置</a>
+    </nav>
+    <span class="spacer"></span>
+    <button id="applyAll" class="primary">同步全部配置<span id="dirtyCount" class="badge warn hidden"></span></button>
+    <span id="adminName" class="muted"></span>
+    <button id="logout">退出</button>
+  </header>
+
+  <main>
+    <section id="tab-nodes">
+      <div class="bar">
+        <h2>节点</h2>
+        <button class="primary" data-act="node-new">添加节点</button>
+      </div>
+      <p class="hint">添加节点时填写 SSH 登录信息，然后点「安装」即可自动部署 v2ray。若后台所在机器无法直连某个节点，在「SSH 跳板」中选择一个能连到它的节点。</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>名称</th><th>SSH</th><th>公网 / 内网地址</th><th>状态</th><th>v2ray</th><th>操作</th></tr></thead>
+        <tbody id="nodeRows"></tbody>
+      </table></div>
+    </section>
+
+    <section id="tab-chains" class="hidden">
+      <div class="bar">
+        <h2>线路</h2>
+        <button class="primary" data-act="chain-new">添加线路</button>
+      </div>
+      <p class="hint">线路 = 用户 → 入口节点 → 中转节点 → 出口节点。修改线路或用户后，点右上角「同步全部配置」下发到各节点。</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>名称</th><th>路径</th><th>端口</th><th>操作</th></tr></thead>
+        <tbody id="chainRows"></tbody>
+      </table></div>
+    </section>
+
+    <section id="tab-users" class="hidden">
+      <div class="bar">
+        <h2>用户</h2>
+        <button class="primary" data-act="user-new">添加用户</button>
+      </div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>用户名</th><th>状态</th><th>可用线路</th><th>备注</th><th>操作</th></tr></thead>
+        <tbody id="userRows"></tbody>
+      </table></div>
+    </section>
+
+    <section id="tab-tasks" class="hidden">
+      <div class="bar"><h2>任务日志</h2></div>
+      <p class="hint">日志保存在内存中，后台重启后清空。</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>任务</th><th>状态</th><th>开始时间</th><th>操作</th></tr></thead>
+        <tbody id="taskRows"></tbody>
+      </table></div>
+    </section>
+
+    <section id="tab-settings" class="hidden">
+      <div class="bar"><h2>设置</h2></div>
+      <form id="settingsForm" class="card narrow">
+        <h3>v2ray 下载地址</h3>
+        <label>安装包地址（<code>{arch}</code> 会替换为 <code>64</code> 或 <code>arm64-v8a</code>）
+          <input name="download_url" required></label>
+        <p class="hint">节点自己下载失败时，会自动改由其它节点（如香港）下载后中转过去。</p>
+        <button class="primary" type="submit">保存</button>
+      </form>
+      <form id="passwordForm" class="card narrow">
+        <h3>管理员账号</h3>
+        <label>用户名<input name="username" autocomplete="username" required></label>
+        <label>当前密码<input name="old" type="password" autocomplete="current-password" required></label>
+        <label>新密码（至少 8 位）<input name="new" type="password" autocomplete="new-password" minlength="8" required></label>
+        <label>确认新密码<input name="new2" type="password" autocomplete="new-password" minlength="8" required></label>
+        <button class="primary" type="submit">修改并重新登录</button>
+      </form>
+    </section>
+  </main>
+</div>
+
+<dialog id="dlg"><form method="dialog" id="dlgForm">
+  <h3 id="dlgTitle"></h3>
+  <div id="dlgBody"></div>
+  <p class="err" id="dlgErr"></p>
+  <div class="actions">
+    <button type="button" id="dlgCancel">取消</button>
+    <button type="submit" class="primary" id="dlgOk">保存</button>
+  </div>
+</form></dialog>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>
