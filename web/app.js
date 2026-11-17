@@ -87,6 +87,7 @@ function render() {
         <button class="small" data-act="node-conf" data-id="${n.id}">配置项</button>
         <button class="small" data-act="node-config" data-id="${n.id}">预览配置</button>
         <button class="small" data-act="node-backups" data-id="${n.id}">备份 / 恢复</button>
+        <button class="small" data-act="node-diag" data-id="${n.id}">日志排查</button>
         <button class="small" data-act="node-edit" data-id="${n.id}">编辑</button>
         ${n.has_host_key ? `<button class="small" data-act="node-hostkey" data-id="${n.id}">重置主机公钥</button>` : ''}
         <button class="small danger" data-act="node-del" data-id="${n.id}">删除</button>
@@ -185,7 +186,174 @@ function showTab(tab) {
   document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
   document.querySelectorAll('main > section').forEach((s) => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
   refresh().catch(() => {});
+  clearInterval(bwTimer);
+  bwTimer = null;
+  if (tab === 'bandwidth') {
+    loadBandwidth();
+    bwTimer = setInterval(loadBandwidth, 5000);
+  }
 }
+
+// ---------- 带宽监控 ----------
+let bwTimer = null;
+let bwRange = '1h';
+let bwData = null;
+const bwIface = {}; // 节点 ID -> 选中的网卡（空 = 合计）
+const BW_SPAN = { '1h': 3600, '24h': 86400, '7d': 604800 };
+
+function fmtRate(v) {
+  const units = ['bps', 'Kbps', 'Mbps', 'Gbps'];
+  let i = 0;
+  while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+  return `${v >= 100 || i === 0 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} ${units[i]}`;
+}
+function fmtBytes(v) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+}
+const pad2 = (n) => String(n).padStart(2, '0');
+function fmtClock(t, withDate, withSec) {
+  const d = new Date(t * 1000);
+  return (withDate ? `${d.getMonth() + 1}-${pad2(d.getDate())} ` : '') + `${pad2(d.getHours())}:${pad2(d.getMinutes())}` + (withSec ? `:${pad2(d.getSeconds())}` : '');
+}
+
+async function loadBandwidth() {
+  if ($('#tab-bandwidth').classList.contains('hidden') || document.hidden) return;
+  const q = new URLSearchParams({ range: bwRange });
+  Object.entries(bwIface).forEach(([id, name]) => { if (name) q.set('iface.' + id, name); });
+  try {
+    bwData = await api('GET', '/api/bandwidth?' + q);
+    renderBandwidth();
+  } catch (err) { /* 下个周期重试 */ }
+}
+
+function renderBandwidth() {
+  const box = $('#bwNodes');
+  if (!bwData.nodes.length) {
+    box.innerHTML = '<div class="card bw-empty">还没有节点</div>';
+    return;
+  }
+  // 卡片只创建一次，之后只更新内容，避免刷新时打断下拉框和悬停提示。
+  bwData.nodes.forEach((n) => {
+    let card = box.querySelector(`[data-node="${n.id}"]`);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'card bw';
+      card.dataset.node = n.id;
+      card.innerHTML = `<div class="bw-head"><h3></h3>
+          <div class="stat"><i style="background:var(--series-rx)"></i>下行（当前）<b data-k="rx"></b></div>
+          <div class="stat"><i style="background:var(--series-tx)"></i>上行（当前）<b data-k="tx"></b></div>
+          <div class="stat">区间下行流量<b data-k="rxb"></b></div>
+          <div class="stat">区间上行流量<b data-k="txb"></b></div>
+          <select aria-label="网卡"></select></div>
+        <div class="bw-chart"></div><div class="bw-ifaces"></div>`;
+      card.querySelector('select').addEventListener('change', (e) => { bwIface[n.id] = e.target.value; loadBandwidth(); });
+      box.appendChild(card);
+    }
+    card.querySelector('h3').innerHTML = `${esc(n.name)} ${n.connected ? '' : `<span class="badge bad">未连接</span>`}`;
+    const physical = n.ifaces.filter((f) => !f.virtual);
+    const cur = n.iface ? n.ifaces.find((f) => f.name === n.iface) : { rx: physical.reduce((s, f) => s + f.rx, 0), tx: physical.reduce((s, f) => s + f.tx, 0) };
+    const set = (k, v) => { card.querySelector(`[data-k=${k}]`).textContent = v; };
+    set('rx', n.connected && cur ? fmtRate(cur.rx) : '-');
+    set('tx', n.connected && cur ? fmtRate(cur.tx) : '-');
+    set('rxb', fmtBytes(n.rx_bytes));
+    set('txb', fmtBytes(n.tx_bytes));
+    const sel = card.querySelector('select');
+    const opts = `<option value="">全部物理网卡合计</option>` + n.ifaces.map((f) => `<option value="${esc(f.name)}">${esc(f.name)}${f.virtual ? '（虚拟）' : ''}</option>`).join('');
+    if (document.activeElement !== sel && sel.dataset.opts !== opts) {
+      sel.innerHTML = opts;
+      sel.dataset.opts = opts;
+    }
+    if (document.activeElement !== sel) sel.value = bwIface[n.id] || '';
+    card.querySelector('.bw-ifaces').innerHTML = n.ifaces.filter((f) => f.name !== 'lo' && (!f.virtual || f.rx || f.tx))
+      .map((f) => `<span><b>${esc(f.name)}</b> ↓ ${fmtRate(f.rx)} ↑ ${fmtRate(f.tx)}</span>`).join('');
+    drawChart(card.querySelector('.bw-chart'), n);
+  });
+  box.querySelectorAll('[data-node]').forEach((c) => {
+    if (!bwData.nodes.some((n) => n.id === c.dataset.node)) c.remove();
+  });
+}
+
+// 画一张双折线图（下行 / 上行共用一个纵轴），带十字线悬停提示。
+function drawChart(el, n) {
+  if (!n.points.length) {
+    el.innerHTML = `<div class="bw-empty">${n.connected ? '正在收集数据，稍等片刻…' : esc(n.error || '未连接')}</div>`;
+    return;
+  }
+  const W = Math.max(el.clientWidth, 320), H = 200, L = 64, R = 12, T = 10, B = 24;
+  const now = Math.floor(Date.now() / 1000), span = BW_SPAN[bwData.range];
+  // 数据还不满一个区间时，横轴从第一个采样点开始（至少显示 5 分钟），避免曲线挤在最右边。
+  const t0 = Math.max(now - span, Math.min(n.points[0][0], now - 300)), pts = n.points.filter((p) => p[0] >= t0);
+  const peak = Math.max(1000, ...pts.map((p) => Math.max(p[1], p[2])));
+  const mag = 10 ** Math.floor(Math.log10(peak));
+  const top = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((v) => v >= peak);
+  const win = now - t0;
+  const x = (t) => L + (t - t0) / win * (W - L - R);
+  const y = (v) => T + (1 - v / top) * (H - T - B);
+  const path = (k) => {
+    let d = '', prev = null;
+    pts.forEach((p) => {
+      // 采样中断超过两个周期时断开折线，不把空档连起来。
+      d += `${prev !== null && p[0] - prev <= bwData.step * 2.5 ? 'L' : 'M'}${x(p[0]).toFixed(1)},${y(p[k]).toFixed(1)}`;
+      prev = p[0];
+    });
+    return d;
+  };
+  let grid = '';
+  for (let i = 0; i <= 4; i++) {
+    const v = top * i / 4;
+    grid += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)" stroke-width="1"/>
+      <text x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${fmtRate(v)}</text>`;
+  }
+  for (let i = 0; i <= 4; i++) {
+    const t = t0 + win * i / 4;
+    grid += `<text x="${x(t)}" y="${H - 6}" text-anchor="${i === 0 ? 'start' : i === 4 ? 'end' : 'middle'}">${fmtClock(t, bwData.range === '7d')}</text>`;
+  }
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(n.name)} 上下行速率">
+      ${grid}
+      <path d="${path(1)}" fill="none" stroke="var(--series-rx)" stroke-width="2" stroke-linejoin="round"/>
+      <path d="${path(2)}" fill="none" stroke="var(--series-tx)" stroke-width="2" stroke-linejoin="round"/>
+      <g class="hover" visibility="hidden">
+        <line y1="${T}" y2="${H - B}" stroke="var(--muted)" stroke-width="1"/>
+        <circle r="4" fill="var(--series-rx)" stroke="var(--panel)" stroke-width="2"/>
+        <circle r="4" fill="var(--series-tx)" stroke="var(--panel)" stroke-width="2"/>
+      </g>
+      <rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent"/>
+    </svg><div class="bw-tip hidden"></div>`;
+  const svg = el.querySelector('svg'), hover = el.querySelector('.hover'), tip = el.querySelector('.bw-tip');
+  const [line, c1, c2] = hover.children;
+  const show = (clientX) => {
+    const box = svg.getBoundingClientRect();
+    const t = t0 + ((clientX - box.left) / box.width * W - L) / (W - L - R) * win;
+    const p = pts.reduce((a, b) => (Math.abs(b[0] - t) < Math.abs(a[0] - t) ? b : a));
+    const px = x(p[0]);
+    line.setAttribute('x1', px); line.setAttribute('x2', px);
+    c1.setAttribute('cx', px); c1.setAttribute('cy', y(p[1]));
+    c2.setAttribute('cx', px); c2.setAttribute('cy', y(p[2]));
+    hover.setAttribute('visibility', 'visible');
+    tip.innerHTML = `<div class="muted">${fmtClock(p[0], bwData.range !== '1h', bwData.range === '1h')}</div>
+      <div><i style="background:var(--series-rx)"></i>下行 <b>${fmtRate(p[1])}</b></div>
+      <div><i style="background:var(--series-tx)"></i>上行 <b>${fmtRate(p[2])}</b></div>`;
+    tip.classList.remove('hidden');
+    const left = px / W * box.width;
+    tip.style.left = left > box.width / 2 ? '' : `${left + 12}px`;
+    tip.style.right = left > box.width / 2 ? `${box.width - left + 12}px` : '';
+    el.dataset.hoverX = clientX;
+  };
+  svg.addEventListener('mousemove', (e) => show(e.clientX));
+  svg.addEventListener('mouseleave', () => { hover.setAttribute('visibility', 'hidden'); tip.classList.add('hidden'); delete el.dataset.hoverX; });
+  if (el.dataset.hoverX) show(+el.dataset.hoverX); // 刷新后保持悬停提示
+}
+
+$('#bwRange').addEventListener('click', (e) => {
+  if (!e.target.dataset.range) return;
+  bwRange = e.target.dataset.range;
+  document.querySelectorAll('#bwRange button').forEach((b) => b.classList.toggle('active', b === e.target));
+  loadBandwidth();
+});
+window.addEventListener('resize', () => { if (bwData && !$('#tab-bandwidth').classList.contains('hidden')) renderBandwidth(); });
 $('#tabs').addEventListener('click', (e) => {
   if (e.target.dataset.tab) showTab(e.target.dataset.tab);
 });
@@ -401,6 +569,49 @@ async function backupsDialog(n) {
   };
 }
 
+// 节点排查：检查项 + 可能的原因 + v2ray 日志。
+async function diagDialog(n) {
+  let lines = 200;
+  let onlyProblems = false;
+  let data = null;
+  const problemRe = /\[(warning|error)\]|fail|error|panic|denied|refused|timeout|invalid/i;
+  const mark = { ok: '<span class="badge ok">正常</span>', warn: '<span class="badge warn">注意</span>', bad: '<span class="badge bad">异常</span>' };
+  const draw = () => {
+    const logs = onlyProblems ? data.logs.filter((l) => problemRe.test(l)) : data.logs;
+    $('#dlgBody').innerHTML = `
+      <table class="diag">${data.checks.map((c) => `<tr><td>${mark[c.status]}</td><td><b>${esc(c.name)}</b></td><td class="muted">${esc(c.detail)}</td></tr>`).join('')}</table>
+      <h4>可能的原因</h4>
+      ${data.hints.map((h) => `<div class="hintbox"><b>${esc(h.title)}</b>${h.count > 1 ? ` <span class="muted">出现 ${h.count} 次</span>` : ''}
+          <p>${esc(h.advice)}</p>${h.sample ? `<pre class="log">${esc(h.sample)}</pre>` : ''}</div>`).join('')
+        || '<p class="muted">没有发现已知问题。</p>'}
+      <div class="bar" style="margin-top:16px"><h4 style="margin:0">v2ray 日志（最近 ${lines} 行${onlyProblems ? '中的错误 / 警告' : ''}，共 ${logs.length} 行）</h4>
+        <span><label class="check" style="display:inline"><input type="checkbox" data-dg="only" ${onlyProblems ? 'checked' : ''}>只看错误 / 警告</label>
+        <button type="button" class="small" data-dg="more">${lines >= 1000 ? '已是最多' : '加载更多'}</button>
+        <button type="button" class="small" data-dg="reload">重新检查</button></span></div>
+      <pre class="log" id="diagLog">${logs.map((l) => (problemRe.test(l) ? `<span class="logbad">${esc(l)}</span>` : esc(l))).join('\n') || '（没有日志）'}</pre>`;
+    const log = $('#diagLog');
+    log.scrollTop = log.scrollHeight;
+  };
+  const load = async () => {
+    $('#dlgBody').innerHTML = '<p class="muted">正在连接节点并收集信息…</p>';
+    try {
+      data = await api('GET', `/api/nodes/${n.id}/diagnose?lines=${lines}`);
+      draw();
+      refresh().catch(() => {});
+    } catch (err) {
+      $('#dlgBody').innerHTML = `<p class="err">${esc(err.message)}</p>`;
+    }
+  };
+  openDialog(`「${n.name}」日志排查`, '', null);
+  $('#dlgBody').onclick = (e) => {
+    const k = e.target.dataset.dg;
+    if (k === 'reload') load();
+    if (k === 'more' && lines < 1000) { lines = 1000; load(); }
+    if (k === 'only') { onlyProblems = e.target.checked; draw(); }
+  };
+  await load();
+}
+
 // ---------- 出口代理 ----------
 function exitImportDialog() {
   openDialog('批量导入出口代理', `
@@ -588,6 +799,7 @@ document.addEventListener('click', async (e) => {
         return;
       case 'node-conf': return confDialog(node);
       case 'node-backups': return backupsDialog(node);
+      case 'node-diag': return diagDialog(node);
       case 'exit-new': return exitDialog();
       case 'exit-import': return exitImportDialog();
       case 'exit-udp': return startTask(`/api/exits/${id}/udp-test`);

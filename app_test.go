@@ -409,3 +409,41 @@ func TestExitUDPHandling(t *testing.T) {
 		t.Error("HTTP 代理始终不转发 UDP")
 	}
 }
+
+func TestBandwidthSampling(t *testing.T) {
+	c := parseNetDev([]string{
+		"Inter-|   Receive                                                |  Transmit",
+		" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed",
+		"    lo: 1000 10 0 0 0 0 0 0 1000 10 0 0 0 0 0 0",
+		"  eth0: 5000000 100 0 0 0 0 0 0 2000000 50 0 0 0 0 0 0",
+	})
+	if c["eth0"] != [2]uint64{5000000, 2000000} || c["lo"] != [2]uint64{1000, 1000} || len(c) != 2 {
+		t.Fatalf("parseNetDev = %v", c)
+	}
+
+	m := newNodeMon("")
+	t0 := time.Unix(1_700_000_000, 0)
+	m.add(t0, 100, map[string][2]uint64{"eth0": {0, 0}, "lo": {0, 0}})
+	if len(m.tiers[0]) != 0 {
+		t.Fatal("第一次采样只应记录基准")
+	}
+	// 5 秒内收 625000 字节 = 1 Mbit/s，发 62500 字节 = 100 kbit/s
+	m.add(t0.Add(5*time.Second), 105, map[string][2]uint64{"eth0": {625000, 62500}, "lo": {999, 999}})
+	s := m.tiers[0][0]
+	if s.R["eth0"].Rx != 1e6 || s.R["eth0"].Tx != 1e5 {
+		t.Errorf("速率 = %+v", s.R["eth0"])
+	}
+	if total := pick(s, ""); total.Rx != 1e6 {
+		t.Errorf("合计不应包含 lo: %+v", total)
+	}
+	// 计数器回绕（节点重启）时跳过该网卡，不产生负值或尖峰
+	m.add(t0.Add(10*time.Second), 110, map[string][2]uint64{"eth0": {10, 10}, "lo": {2000, 2000}})
+	if _, ok := m.tiers[0][1].R["eth0"]; ok {
+		t.Error("计数器变小时不应计算速率")
+	}
+	// 跨过一分钟后，1 分钟档应得到上一分钟的平均值
+	m.add(t0.Add(65*time.Second), 165, map[string][2]uint64{"eth0": {20, 20}, "lo": {3000, 3000}})
+	if len(m.tiers[1]) != 1 || m.tiers[1][0].R["eth0"].Rx != 1e6 {
+		t.Errorf("1 分钟聚合 = %+v", m.tiers[1])
+	}
+}

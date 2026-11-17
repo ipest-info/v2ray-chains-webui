@@ -26,6 +26,7 @@
       <a data-tab="chains">线路</a>
       <a data-tab="exits">出口代理</a>
       <a data-tab="users">用户</a>
+      <a data-tab="bandwidth">带宽监控</a>
       <a data-tab="tasks">任务日志</a>
       <a data-tab="settings">设置</a>
     </nav>
@@ -48,6 +49,7 @@
             <li><b>同步后出问题</b>：节点的「备份 / 恢复」里有每次同步前自动保存的配置，可以一键恢复。</li>
             <li><b>让某个用户换出口</b>：编辑用户，在「最终出口」里选一个出口代理，其它用户不受影响。</li>
             <li><b>出口代理的 UDP</b>：在「出口代理」页点「检测 UDP」。代理不支持时，编辑线路选择把 UDP 丢弃，还是改从最后一个节点直接出网。</li>
+            <li><b>用户连不上或速度异常</b>：从入口节点开始，逐个点节点的「日志排查」，它会检查服务状态、端口、配置、时间，并解释日志里的常见报错。「带宽监控」页可以看各节点网卡的实时速率。</li>
             <li><b>节点连不通</b>：线路页点「检测连通性」逐跳检查；最常见的原因是云厂商安全组没有放行线路端口。</li>
             <li><b>某个节点需要特殊设置</b>：节点的「配置项」可以改日志级别、DNS，或追加自定义 JSON；「预览配置」查看最终下发的内容。</li>
           </ul>
@@ -100,6 +102,19 @@
         <thead><tr><th>用户名</th><th>状态</th><th>可用线路</th><th>出口</th><th>备注</th><th>操作</th></tr></thead>
         <tbody id="userRows"></tbody>
       </table></div>
+    </section>
+
+    <section id="tab-bandwidth" class="hidden">
+      <div class="bar">
+        <h2>带宽监控</h2>
+        <div class="seg" id="bwRange">
+          <button data-range="1h" class="active">1 小时</button>
+          <button data-range="24h">24 小时</button>
+          <button data-range="7d">7 天</button>
+        </div>
+      </div>
+      <p class="hint">各节点网卡的实时上下行速率，每 5 秒采样一次（24 小时视图为 1 分钟平均，7 天视图为 10 分钟平均）。统计的是整台服务器的网卡流量，不只是 v2ray；数据保存在后台内存中，后台重启后重新累积。</p>
+      <div id="bwNodes"></div>
     </section>
 
     <section id="tab-tasks" class="hidden">

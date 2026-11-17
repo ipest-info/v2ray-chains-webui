@@ -62,6 +62,8 @@ func main() {
 		store: store, auth: newAuth(), tasks: &Tasks{},
 		dataDir: *dataDir, certs: &certManager{dir: filepath.Join(*dataDir, "tls")},
 	}
+	app.monitor = &Monitor{app: app, nodes: map[string]*nodeMon{}}
+	go app.monitor.run()
 	handler := app.routes()
 	srv := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	if *tlsCert != "" {

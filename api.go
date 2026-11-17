@@ -26,6 +26,7 @@ type App struct {
 	certs     *certManager
 	httpsPort string // HTTPS 监听端口，空表示未启用
 	acmeMu    sync.Mutex
+	monitor   *Monitor
 }
 
 type apiError struct {
@@ -114,6 +115,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/nodes/{id}/apply", a.api(a.nodeApply))
 	mux.HandleFunc("POST /api/nodes/{id}/reset-hostkey", a.api(a.nodeResetHostKey))
 	mux.HandleFunc("GET /api/nodes/{id}/config", a.api(a.nodeConfig))
+	mux.HandleFunc("GET /api/nodes/{id}/diagnose", a.api(a.nodeDiagnose))
 	mux.HandleFunc("POST /api/apply-all", a.api(a.applyAll))
 	mux.HandleFunc("PUT /api/nodes/{id}/conf", a.api(a.saveNodeConf))
 	mux.HandleFunc("GET /api/nodes/{id}/backups", a.api(a.backupList))
@@ -139,6 +141,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/users/{id}/reset", a.api(a.resetUser))
 
 	mux.HandleFunc("GET /api/tasks/{id}", a.api(a.taskGet))
+	mux.HandleFunc("GET /api/bandwidth", a.api(a.bandwidth))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
