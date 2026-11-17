@@ -414,7 +414,61 @@ for p in @PORTS@; do
 done
 restart_v2ray
 echo ">> 配置已生效"
+# 限速规则：有规则要下发，或节点上以前下发过（需要更新 / 清空）时才处理。
+if [ -n "@HASLIMITS@" ] || [ -f "$D/vcw-limits.sh" ]; then
+cat > "$D/vcw-limits.sh" <<'VCW_LIMITS_EOF'
+@LIMITS@
+VCW_LIMITS_EOF
+  # 开机后自动重新加载限速规则（tc 规则重启后会丢失）
+  if [ ! -f /etc/systemd/system/vcw-limits.service ]; then
+    cat > /etc/systemd/system/vcw-limits.service <<'VCW_UNIT_EOF'
+[Unit]
+Description=Per-user rate limits (managed by v2ray-chains-webui)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /usr/local/etc/v2ray/vcw-limits.sh
+
+[Install]
+WantedBy=multi-user.target
+VCW_UNIT_EOF
+    systemctl daemon-reload
+    systemctl enable vcw-limits >/dev/null 2>&1 || true
+  fi
+  bash "$D/vcw-limits.sh" || { echo "限速规则没有生效，被限速的用户目前不受限"; exit 1; }
+fi
 `
+
+const clearLimitsScript = `
+F=/usr/local/etc/v2ray/vcw-limits.sh
+[ -f "$F" ] || { echo "该节点上没有下发过限速规则"; exit 0; }
+bash "$F" clear
+`
+
+// clearLimits 立即清除节点上的全部限速规则（下次同步配置时会按后台数据重新下发）。
+func (a *App) clearLimits(t *Task, nodeID string) error {
+	l := a.tasks.nodeLock(nodeID)
+	l.Lock()
+	defer l.Unlock()
+	conn, db, err := a.connect(nodeID)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := runRootScript(conn.Client, db.node(nodeID), clearLimitsScript, t, time.Minute); err != nil {
+		return err
+	}
+	t.logf("限速规则已清除；节点已标记为「配置待同步」，再次同步会重新下发")
+	return a.store.Update(func(d *DB) error {
+		if n := d.node(nodeID); n != nil && len(nodeLimits(d, nodeID)) > 0 {
+			n.AppliedHash = "limits-cleared"
+		}
+		return nil
+	})
+}
 
 const backupNowScript = scriptHead + `
 [ -f "$D/config.json" ] || { echo "节点上还没有配置文件"; exit 1; }
@@ -571,13 +625,21 @@ func (a *App) applyOn(t *Task, conn *sshConn, nodeID string) error {
 		ps[i] = strconv.Itoa(p)
 	}
 	t.logf("同步配置到「%s」（监听端口: %s）", n.Name, strings.Join(ps, " "))
-	if err := runRootScript(conn.Client, n, strings.NewReplacer("@CONFIG@", cfg, "@PORTS@", strings.Join(ps, " ")).Replace(applyScript), t, 2*time.Minute); err != nil {
+	limits := nodeLimits(db, nodeID)
+	has := ""
+	if len(limits) > 0 {
+		has = "1"
+		t.logf("下发 %d 条按用户限速规则", len(limits))
+	}
+	script := strings.NewReplacer("@CONFIG@", cfg, "@PORTS@", strings.Join(ps, " "),
+		"@HASLIMITS@", has, "@LIMITS@", limitsScript(limits)).Replace(applyScript)
+	if err := runRootScript(conn.Client, n, script, t, 2*time.Minute); err != nil {
 		return fmt.Errorf("同步配置失败: %w", err)
 	}
 	ver, active := probe(conn)
 	return a.store.Update(func(d *DB) error {
 		if n := d.node(nodeID); n != nil {
-			n.AppliedHash, n.AppliedAt = configHash(cfg), time.Now()
+			n.AppliedHash, n.AppliedAt = nodeHash(db, nodeID), time.Now()
 			n.Status, n.StatusMsg, n.CheckedAt = "online", "", time.Now()
 			n.V2rayVersion, n.ServiceActive = ver, active
 		}

@@ -88,6 +88,7 @@ function render() {
         <button class="small" data-act="node-config" data-id="${n.id}">预览配置</button>
         <button class="small" data-act="node-backups" data-id="${n.id}">备份 / 恢复</button>
         <button class="small" data-act="node-diag" data-id="${n.id}">日志排查</button>
+        ${n.has_limits ? `<button class="small" data-act="node-limits-clear" data-id="${n.id}">清除限速</button>` : ''}
         <button class="small" data-act="node-edit" data-id="${n.id}">编辑</button>
         ${n.has_host_key ? `<button class="small" data-act="node-hostkey" data-id="${n.id}">重置主机公钥</button>` : ''}
         <button class="small danger" data-act="node-del" data-id="${n.id}">删除</button>
@@ -126,6 +127,7 @@ function render() {
       <td><span class="badge ${u.enabled ? 'ok' : 'bad'}">${u.enabled ? '启用' : '停用'}</span></td>
       <td>${u.chain_ids.length ? u.chain_ids.map((id) => esc((S.chains.find((c) => c.id === id) || {}).name || '?')).join('、') : '全部线路'}</td>
       <td>${!u.exit_id ? '<span class="muted">跟随线路</span>' : u.exit_id === 'direct' ? '末端节点直连' : `<span class="badge warn">${esc(exitName(u.exit_id))}</span>`}</td>
+      <td>${u.limit_down || u.limit_up ? `↓ ${u.limit_down ? u.limit_down + ' Mbps' : '不限'}<br>↑ ${u.limit_up ? u.limit_up + ' Mbps' : '不限'}` : '<span class="muted">不限</span>'}</td>
       <td>${esc(u.remark)}</td>
       <td class="ops">
         <button class="small" data-act="user-links" data-id="${u.id}">连接信息</button>
@@ -133,7 +135,7 @@ function render() {
         <button class="small" data-act="user-edit" data-id="${u.id}">编辑</button>
         <button class="small" data-act="user-reset" data-id="${u.id}">重置凭据</button>
         <button class="small danger" data-act="user-del" data-id="${u.id}">删除</button>
-      </td></tr>`).join('') || '<tr><td colspan="6" class="empty">还没有用户</td></tr>';
+      </td></tr>`).join('') || '<tr><td colspan="7" class="empty">还没有用户</td></tr>';
 
   $('#taskRows').innerHTML = S.tasks.map((t) => `<tr>
       <td>${esc(t.title)}</td>
@@ -779,13 +781,21 @@ function userDialog(u) {
         <option value="">跟随线路的默认出口</option>
         <option value="direct" ${u.exit_id === 'direct' ? 'selected' : ''}>从线路最后一个节点直接出网</option>
         ${S.exits.map((x) => `<option value="${x.id}" ${u.exit_id === x.id ? 'selected' : ''}>经出口代理「${esc(x.name)}」</option>`).join('')}</select></label>
+    <fieldset><legend>限速（Mbit/s，留空或 0 表示不限）</legend>
+      <div class="row">
+        <label>下行（用户下载）<input name="limit_down" type="number" min="0" max="10000" step="0.1" value="${u.limit_down || ''}" placeholder="不限"></label>
+        <label>上行（用户上传）<input name="limit_up" type="number" min="0" max="10000" step="0.1" value="${u.limit_up || ''}" placeholder="不限"></label>
+      </div>
+      <p class="hint" style="margin:0">限速在入口节点上按端口实现：开启或取消限速会<strong>改变该用户的连接端口</strong>（专属端口从 30000 起分配），用户需要更新订阅或重新导入链接，入口节点的安全组也要放行新端口。只修改限速数值不会换端口。</p>
+    </fieldset>
     <label class="check"><input type="checkbox" name="enabled" ${u.enabled ? 'checked' : ''}>启用</label>
     <fieldset><legend>可用线路（一个都不勾选 = 全部线路，包括以后新增的）</legend>
       ${S.chains.map((c) => `<label class="check"><input type="checkbox" name="chain" value="${c.id}" ${u.chain_ids.includes(c.id) ? 'checked' : ''}>${esc(c.name)}</label>`).join('') || '<span class="muted">还没有线路</span>'}
     </fieldset>`, async (f) => {
     const chain_ids = [...f.querySelectorAll('input[name=chain]:checked')].map((x) => x.value);
     await api(edit ? 'PUT' : 'POST', '/api/users' + (edit ? '/' + u.id : ''),
-      { name: f.name.value, remark: f.remark.value, enabled: f.enabled.checked, chain_ids, exit_id: f.exit_id.value });
+      { name: f.name.value, remark: f.remark.value, enabled: f.enabled.checked, chain_ids, exit_id: f.exit_id.value,
+        limit_down: +f.limit_down.value || 0, limit_up: +f.limit_up.value || 0 });
   });
 }
 
@@ -798,6 +808,7 @@ function linksDialog(u) {
     ${item('UUID', u.uuid)}
     ${item('订阅地址（导入 v2rayN / v2rayNG 等客户端，包含全部可用线路）', sub)}
     ${u.links.map((l) => item(`${l.name}　出口：${l.exit}`, l.link)).join('') || '<p class="muted">暂无可用线路</p>'}
+    ${u.limit_down || u.limit_up ? `<p class="hint">该用户已限速（下行 ${u.limit_down || '不限'} / 上行 ${u.limit_up || '不限'} Mbps），使用专属端口 ${[...new Set(Object.values(u.ports || {}))].join('、')}，请在入口节点的安全组中放行。</p>` : ''}
     <p class="hint">协议 VMess / TCP / alterId 0。新建或修改后需「同步全部配置」才会生效。</p>`, null);
 }
 
@@ -842,6 +853,9 @@ document.addEventListener('click', async (e) => {
       case 'node-conf': return confDialog(node);
       case 'node-backups': return backupsDialog(node);
       case 'node-diag': return diagDialog(node);
+      case 'node-limits-clear':
+        if (confirm(`立即清除「${node.name}」上的全部限速规则？被限速的用户将暂时不受限，直到下次同步配置。`)) await startTask(`/api/nodes/${id}/limits/clear`);
+        return;
       case 'exit-new': return exitDialog();
       case 'exit-import': return exitImportDialog();
       case 'exit-udp': return startTask(`/api/exits/${id}/udp-test`);
@@ -863,7 +877,7 @@ document.addEventListener('click', async (e) => {
       case 'user-edit': return userDialog(user);
       case 'user-links': return linksDialog(user);
       case 'user-toggle':
-        await api('PUT', `/api/users/${id}`, { name: user.name, remark: user.remark, chain_ids: user.chain_ids, exit_id: user.exit_id, enabled: !user.enabled });
+        await api('PUT', `/api/users/${id}`, { name: user.name, remark: user.remark, chain_ids: user.chain_ids, exit_id: user.exit_id, limit_down: user.limit_down, limit_up: user.limit_up, enabled: !user.enabled });
         return refresh();
       case 'user-reset':
         if (confirm(`重置「${user.name}」的 UUID 和订阅地址？同步配置后旧凭据失效。`)) { await api('POST', `/api/users/${id}/reset`); await refresh(); }

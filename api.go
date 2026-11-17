@@ -116,6 +116,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/nodes/{id}/reset-hostkey", a.api(a.nodeResetHostKey))
 	mux.HandleFunc("GET /api/nodes/{id}/config", a.api(a.nodeConfig))
 	mux.HandleFunc("GET /api/nodes/{id}/diagnose", a.api(a.nodeDiagnose))
+	mux.HandleFunc("POST /api/nodes/{id}/limits/clear", a.api(a.nodeClearLimits))
 	mux.HandleFunc("POST /api/apply-all", a.api(a.applyAll))
 	mux.HandleFunc("PUT /api/nodes/{id}/conf", a.api(a.saveNodeConf))
 	mux.HandleFunc("GET /api/nodes/{id}/backups", a.api(a.backupList))
@@ -239,6 +240,7 @@ type nodeView struct {
 	HasKey      bool `json:"has_key"`
 	HasHostKey  bool `json:"has_host_key"`
 	Dirty       bool `json:"dirty"`
+	HasLimits   bool `json:"has_limits"`
 }
 
 type exitView struct {
@@ -258,13 +260,18 @@ func (a *App) state(w http.ResponseWriter, r *http.Request) (any, error) {
 	for _, n := range db.Nodes {
 		cfg, ports := configJSON(db, n.ID)
 		v := nodeView{Node: *n, HasPassword: n.SSHPassword != "", HasKey: n.SSHKey != "", HasHostKey: n.HostKey != ""}
-		v.Dirty = n.AppliedHash != configHash(cfg) && (n.AppliedHash != "" || len(ports) > 0)
+		v.Dirty = n.AppliedHash != nodeHash(db, n.ID) && (n.AppliedHash != "" || len(ports) > 0)
+		v.HasLimits = len(nodeLimits(db, n.ID)) > 0
+		_ = cfg
 		v.SSHPassword, v.SSHKey, v.HostKey = "", "", ""
 		nodes = append(nodes, v)
 	}
 	users := make([]userView, 0, len(db.Users))
 	for _, u := range db.Users {
 		v := userView{User: *u, Links: []obj{}}
+		if v.ChainIDs == nil {
+			v.ChainIDs = []string{}
+		}
 		for _, c := range db.Chains {
 			if userAllowed(u, c.ID) {
 				exit := "末端节点直连"
@@ -492,6 +499,16 @@ func (a *App) applyAll(w http.ResponseWriter, r *http.Request) (any, error) {
 		}
 		return nil
 	})
+	return obj{"task_id": t.ID}, nil
+}
+
+func (a *App) nodeClearLimits(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	name, err := a.nodeName(id)
+	if err != nil {
+		return nil, err
+	}
+	t := a.tasks.Start("清除限速规则：「"+name+"」", func(t *Task) error { return a.clearLimits(t, id) })
 	return obj{"task_id": t.ID}, nil
 }
 
@@ -734,6 +751,13 @@ func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 		if entry := db.node(in.Hops[0].NodeID); entry.PublicAddr == "" {
 			return bad("入口节点「%s」未填写公网地址，用户无法连接", entry.Name)
 		}
+		for _, u := range db.Users {
+			for _, p := range u.Ports {
+				if p == in.Port {
+					return bad("端口 %d 已分配为用户「%s」的限速专属端口，请换一个", in.Port, u.Name)
+				}
+			}
+		}
 		for _, c := range db.Chains {
 			if c.ID == id || c.Port != in.Port {
 				continue
@@ -806,11 +830,13 @@ func (a *App) chainTest(w http.ResponseWriter, r *http.Request) (any, error) {
 func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 	id := r.PathValue("id")
 	var in struct {
-		Name     string   `json:"name"`
-		Enabled  bool     `json:"enabled"`
-		ChainIDs []string `json:"chain_ids"`
-		Remark   string   `json:"remark"`
-		ExitID   string   `json:"exit_id"`
+		Name      string   `json:"name"`
+		Enabled   bool     `json:"enabled"`
+		ChainIDs  []string `json:"chain_ids"`
+		Remark    string   `json:"remark"`
+		ExitID    string   `json:"exit_id"`
+		LimitDown float64  `json:"limit_down"`
+		LimitUp   float64  `json:"limit_up"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
@@ -818,6 +844,12 @@ func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 	in.Name = strings.TrimSpace(in.Name)
 	if in.Name == "" || len(in.Name) > 64 {
 		return nil, bad("请填写用户名（最多 64 个字符）")
+	}
+	for _, v := range []float64{in.LimitDown, in.LimitUp} {
+		// 低于 0.1 Mbit/s 的限速会让连接几乎不可用，高于 10 Gbit/s 没有意义。
+		if v != 0 && (v < 0.1 || v > 10000) {
+			return nil, bad("限速范围 0.1 - 10000 Mbit/s，0 表示不限")
+		}
 	}
 	return nil, a.store.Update(func(db *DB) error {
 		for _, u := range db.Users {
@@ -845,6 +877,7 @@ func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 		}
 		u.Name, u.Enabled, u.ChainIDs, u.Remark = in.Name, in.Enabled, in.ChainIDs, strings.TrimSpace(in.Remark)
 		u.ExitID = in.ExitID
+		u.LimitDown, u.LimitUp = in.LimitDown, in.LimitUp
 		return nil
 	})
 }

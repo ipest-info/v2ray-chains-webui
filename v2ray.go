@@ -139,13 +139,18 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 		variants, vusers := chainVariants(db, c)
 
 		clients := []any{}
+		var dedicated []*User // 限速用户：各自使用专属端口上的独立入站
 		if idx == 0 {
 			for _, v := range variants {
 				for _, u := range vusers[v] {
+					if userPort(u, c) != c.Port {
+						dedicated = append(dedicated, u)
+						continue
+					}
 					clients = append(clients, obj{"id": u.UUID, "alterId": 0, "email": u.Name})
 				}
 			}
-			if len(clients) == 0 {
+			if len(clients) == 0 && len(dedicated) == 0 {
 				continue // 没有可用用户时不开放入口
 			}
 		} else {
@@ -154,21 +159,31 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 				clients = append(clients, obj{"id": id, "alterId": 0, "email": email})
 			}
 		}
-		in := obj{
-			"tag":            inTag,
-			"listen":         "0.0.0.0",
-			"port":           c.Port,
-			"protocol":       "vmess",
-			"settings":       obj{"clients": clients},
-			"streamSettings": obj{"network": "tcp"},
+		inTags := []string{}
+		addInbound := func(tag string, port int, clients []any) {
+			in := obj{
+				"tag":            tag,
+				"listen":         "0.0.0.0",
+				"port":           port,
+				"protocol":       "vmess",
+				"settings":       obj{"clients": clients},
+				"streamSettings": obj{"network": "tcp"},
+			}
+			if conf.Sniffing {
+				in["sniffing"] = obj{"enabled": true, "destOverride": []string{"http", "tls"}}
+			}
+			inbounds = append(inbounds, in)
+			ports = append(ports, port)
+			inTags = append(inTags, tag)
 		}
-		if conf.Sniffing {
-			in["sniffing"] = obj{"enabled": true, "destOverride": []string{"http", "tls"}}
+		if len(clients) > 0 {
+			addInbound(inTag, c.Port, clients)
 		}
-		inbounds = append(inbounds, in)
-		ports = append(ports, c.Port)
+		for _, u := range dedicated {
+			addInbound(inTag+"-"+u.ID, userPort(u, c), []any{obj{"id": u.UUID, "alterId": 0, "email": u.Name}})
+		}
 		if last {
-			exitTags = append(exitTags, inTag)
+			exitTags = append(exitTags, inTags...)
 		}
 
 		var nn *Node
@@ -214,7 +229,7 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 					"streamSettings": obj{"network": "tcp"},
 				})
 			}
-			rule := obj{"type": "field", "inboundTag": []string{inTag}, "outboundTag": outTag}
+			rule := obj{"type": "field", "inboundTag": inTags, "outboundTag": outTag}
 			if i > 0 {
 				emails := []string{}
 				if idx == 0 {
@@ -228,7 +243,7 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 				rule["user"] = emails
 			}
 			if udpTag != "" {
-				udpRule := obj{"type": "field", "inboundTag": []string{inTag}, "network": "udp", "outboundTag": udpTag}
+				udpRule := obj{"type": "field", "inboundTag": inTags, "network": "udp", "outboundTag": udpTag}
 				if us, ok := rule["user"]; ok {
 					udpRule["user"] = us
 				}
@@ -359,7 +374,7 @@ func vmessLink(db *DB, u *User, c *Chain) string {
 		return ""
 	}
 	b, _ := json.Marshal(obj{
-		"v": "2", "ps": c.Name, "add": hopAddr(entry, "public"), "port": strconv.Itoa(c.Port),
+		"v": "2", "ps": c.Name, "add": hopAddr(entry, "public"), "port": strconv.Itoa(userPort(u, c)),
 		"id": u.UUID, "aid": "0", "scy": "auto", "net": "tcp", "type": "none", "host": "", "path": "", "tls": "",
 	})
 	return "vmess://" + base64.StdEncoding.EncodeToString(b)

@@ -501,3 +501,73 @@ func TestUserStats(t *testing.T) {
 		t.Errorf("没有流量的用户应得到 0 值曲线: %v", points)
 	}
 }
+
+func TestUserRateLimit(t *testing.T) {
+	db := testDB()
+	alice := db.Users[0]
+	db.Users = append(db.Users, &User{ID: "u9", Name: "erin", UUID: "erin-uuid", Enabled: true})
+	alice.LimitDown, alice.LimitUp = 10, 0.5
+	ensureLimitPorts(db)
+	port := alice.Ports["c1"]
+	if port < limitPortBase || len(db.Users[3].Ports) != 0 {
+		t.Fatalf("限速用户应分配专属端口: %v / %v", alice.Ports, db.Users[3].Ports)
+	}
+
+	// 入口节点：限速用户在专属端口的独立入站里，其余用户仍在线路端口；两者走同一套路由规则。
+	cfg, ports := buildConfig(db, "gz")
+	if len(ports) != 2 || ports[0] != 20001 || ports[1] != port {
+		t.Errorf("ports = %v", ports)
+	}
+	for _, in := range cfg["inbounds"].([]any) {
+		in := in.(obj)
+		if in["tag"] == "api" {
+			continue
+		}
+		clients := in["settings"].(obj)["clients"].([]any)
+		email := clients[0].(obj)["email"]
+		if (in["port"] == port) != (email == "alice") || len(clients) != 1 {
+			t.Errorf("入站 %v 的用户不正确: %v", in["port"], clients)
+		}
+	}
+	rules := cfg["routing"].(obj)["rules"].([]any)
+	if tags := rules[len(rules)-1].(obj)["inboundTag"].([]string); len(tags) != 2 {
+		t.Errorf("路由规则应同时覆盖线路入站和专属入站: %v", tags)
+	}
+	// 中转节点不受影响。
+	if _, ports := buildConfig(db, "hk"); len(ports) != 1 {
+		t.Errorf("中转节点不应监听专属端口: %v", ports)
+	}
+
+	// 分享链接使用专属端口。
+	raw, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(vmessLink(db, alice, db.Chains[0]), "vmess://"))
+	if !strings.Contains(string(raw), fmt.Sprintf(`"port":"%d"`, port)) {
+		t.Errorf("链接端口不正确: %s", raw)
+	}
+
+	// 限速规则只下发到入口节点；限速值变化会让节点变为「待同步」。
+	lim := nodeLimits(db, "gz")
+	if len(lim) != 1 || lim[0].Port != port || lim[0].DownKbit != 10000 || lim[0].UpKbit != 500 {
+		t.Errorf("limits = %+v", lim)
+	}
+	if len(nodeLimits(db, "hk")) != 0 {
+		t.Error("非入口节点不应有限速规则")
+	}
+	before := nodeHash(db, "gz")
+	alice.LimitDown = 20
+	if nodeHash(db, "gz") == before {
+		t.Error("修改限速值后指纹应变化")
+	}
+
+	// 取消限速后回到线路端口，但端口保留，再次开启时不变。
+	alice.LimitDown, alice.LimitUp = 0, 0
+	ensureLimitPorts(db)
+	if userPort(alice, db.Chains[0]) != 20001 || alice.Ports["c1"] != port {
+		t.Errorf("取消限速后: port=%d ports=%v", userPort(alice, db.Chains[0]), alice.Ports)
+	}
+	// 线路删除后回收端口。
+	db.Chains = nil
+	ensureLimitPorts(db)
+	if len(alice.Ports) != 0 {
+		t.Errorf("线路删除后应回收端口: %v", alice.Ports)
+	}
+}

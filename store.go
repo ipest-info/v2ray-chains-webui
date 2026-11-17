@@ -99,15 +99,20 @@ type Chain struct {
 
 // User 是一个代理账号。
 type User struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	UUID      string    `json:"uuid"`
-	SubToken  string    `json:"sub_token"`
-	Enabled   bool      `json:"enabled"`
-	ChainIDs  []string  `json:"chain_ids"` // 为空表示可使用全部线路
-	ExitID    string    `json:"exit_id"`   // 为空跟随线路；direct 表示末端节点直连；否则为指定出口代理
-	Remark    string    `json:"remark"`
-	CreatedAt time.Time `json:"created_at"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	UUID     string   `json:"uuid"`
+	SubToken string   `json:"sub_token"`
+	Enabled  bool     `json:"enabled"`
+	ChainIDs []string `json:"chain_ids"` // 为空表示可使用全部线路
+	ExitID   string   `json:"exit_id"`   // 为空跟随线路；direct 表示末端节点直连；否则为指定出口代理
+
+	// 限速（Mbit/s，0 表示不限）。限速用户在每条线路上使用专属端口：线路 ID -> 端口。
+	LimitDown float64        `json:"limit_down"`
+	LimitUp   float64        `json:"limit_up"`
+	Ports     map[string]int `json:"ports,omitempty"`
+	Remark    string         `json:"remark"`
+	CreatedAt time.Time      `json:"created_at"`
 }
 
 type Admin struct {
@@ -176,6 +181,7 @@ func (s *Store) Update(fn func(db *DB) error) error {
 	if err := fn(&s.db); err != nil {
 		return err
 	}
+	ensureLimitPorts(&s.db)
 	return s.saveLocked()
 }
 

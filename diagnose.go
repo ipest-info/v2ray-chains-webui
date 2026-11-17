@@ -214,7 +214,8 @@ func (a *App) diagnoseNode(nodeID string, lines int) (obj, error) {
 	}
 
 	// 配置是否与后台一致
-	if n.AppliedHash == configHash(cfg) {
+	_ = cfg
+	if n.AppliedHash == nodeHash(db, nodeID) {
 		add("配置已同步", "ok", "")
 	} else {
 		add("配置已同步", "warn", "节点上的配置与后台当前数据不一致")
