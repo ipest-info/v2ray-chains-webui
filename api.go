@@ -122,6 +122,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/nodes/{id}/backups/{name}/restore", a.api(a.backupRestore))
 
 	mux.HandleFunc("POST /api/exits", a.api(a.saveExit))
+	mux.HandleFunc("POST /api/exits/import", a.api(a.importExits))
 	mux.HandleFunc("PUT /api/exits/{id}", a.api(a.saveExit))
 	mux.HandleFunc("DELETE /api/exits/{id}", a.api(a.deleteExit))
 

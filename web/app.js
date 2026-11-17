@@ -337,6 +337,29 @@ async function backupsDialog(n) {
 }
 
 // ---------- 出口代理 ----------
+function exitImportDialog() {
+  openDialog('批量导入出口代理', `
+    <label>没有写协议的行按此协议导入<select name="protocol">
+      <option value="socks">SOCKS5</option><option value="http">HTTP</option></select></label>
+    <label>代理列表（每行一个）
+      <textarea name="text" class="code" spellcheck="false" required placeholder="socks5://user:pass@1.2.3.4:1080#美国01&#10;http://user:pass@proxy.example.com:8080&#10;1.2.3.4:1080:user:pass&#10;user:pass@1.2.3.4:1080&#10;1.2.3.4:1080 日本02"></textarea></label>
+    <p class="hint">支持的格式：<code>协议://用户:密码@地址:端口</code>、<code>用户:密码@地址:端口</code>、<code>地址:端口:用户:密码</code>、<code>地址:端口</code>。
+      行尾可用 <code>#名称</code> 或空格加名称来命名，不写则用「地址:端口」。已存在的代理（协议、地址、端口、用户名都相同）会自动跳过。</p>
+    <pre class="log hidden" id="importResult"></pre>`,
+  async (f) => {
+    const r = await api('POST', '/api/exits/import', { text: f.text.value, protocol: f.protocol.value });
+    const summary = `已导入 ${r.added} 条` + (r.skipped ? `，跳过重复 ${r.skipped} 条` : '');
+    if (r.errors.length) {
+      // 有问题的行留在对话框里，方便修改后再次导入。
+      await refresh();
+      $('#importResult').textContent = r.errors.join('\n');
+      $('#importResult').classList.remove('hidden');
+      throw new Error(`${summary}，${r.errors.length} 行有问题未导入：`);
+    }
+    toast(summary);
+  }, '导入');
+}
+
 function exitDialog(x) {
   const edit = !!x;
   x = x || { protocol: 'socks', port: 1080 };
@@ -489,6 +512,7 @@ document.addEventListener('click', async (e) => {
       case 'node-conf': return confDialog(node);
       case 'node-backups': return backupsDialog(node);
       case 'exit-new': return exitDialog();
+      case 'exit-import': return exitImportDialog();
       case 'exit-edit': return exitDialog(S.exits.find((x) => x.id === id));
       case 'exit-del':
         if (confirm('删除该出口代理？')) { await api('DELETE', `/api/exits/${id}`); await refresh(); }

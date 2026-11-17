@@ -336,3 +336,33 @@ func TestJumpLoopRejected(t *testing.T) {
 		t.Error("循环跳板应报错")
 	}
 }
+
+func TestParseExitLine(t *testing.T) {
+	ok := []struct {
+		line, def      string
+		proto, addr    string
+		port           int
+		user, pw, name string
+	}{
+		{"socks5://u:p@1.2.3.4:1080#美国01", "http", "socks", "1.2.3.4", 1080, "u", "p", "美国01"},
+		{"http://proxy.example.com:8080/", "socks", "http", "proxy.example.com", 8080, "", "", "proxy.example.com:8080"},
+		{"1.2.3.4:1080:user:pa:ss", "socks", "socks", "1.2.3.4", 1080, "user", "pa:ss", "1.2.3.4:1080"},
+		{"user:p@ss@1.2.3.4:3128 日本 02", "http", "http", "1.2.3.4", 3128, "user", "p@ss", "日本 02"},
+		{"1.2.3.4:1080", "socks", "socks", "1.2.3.4", 1080, "", "", "1.2.3.4:1080"},
+	}
+	for _, c := range ok {
+		e, err := parseExitLine(c.line, c.def)
+		if err != nil {
+			t.Errorf("%q: %v", c.line, err)
+			continue
+		}
+		if e.Protocol != c.proto || e.Address != c.addr || e.Port != c.port || e.Username != c.user || e.Password != c.pw || e.Name != c.name {
+			t.Errorf("%q => %+v", c.line, e)
+		}
+	}
+	for _, line := range []string{"1.2.3.4", "1.2.3.4:abc", "ss://x@1.2.3.4:1", "1.2.3.4:99999", "bad host:1080:u:p", ":p@1.2.3.4:1080"} {
+		if e, err := parseExitLine(line, "socks"); err == nil {
+			t.Errorf("%q 应当报错，却得到 %+v", line, e)
+		}
+	}
+}
