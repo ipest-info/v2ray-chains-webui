@@ -90,3 +90,21 @@ textarea.code { min-height: 180px; font-family: ui-monospace, SFMono-Regular, Me
 .backup:last-child { border-bottom: 0; }
 .backup .mono { flex: 1; }
 a { color: var(--accent); }
+
+.guide { margin-bottom: 20px; padding: 14px 20px; }
+.guide summary { cursor: pointer; display: flex; gap: 12px; align-items: baseline; list-style: none; }
+.guide summary::-webkit-details-marker { display: none; }
+.guide summary::before { content: "▸"; color: var(--muted); }
+.guide[open] summary::before { content: "▾"; }
+.guide ol { list-style: none; margin: 14px 0 0; padding: 0; counter-reset: step; }
+.guide ol li { display: flex; gap: 12px; margin-bottom: 12px; counter-increment: step; }
+.guide .mark { flex: none; width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--line);
+  display: grid; place-items: center; font-size: 12px; font-weight: 600; color: var(--muted); }
+.guide .mark:empty::before { content: counter(step); }
+.guide li.done .mark { background: var(--ok-bg); border-color: var(--ok-bg); color: var(--ok); }
+.guide li p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+.guide li a { margin-left: 8px; font-size: 13px; cursor: pointer; }
+.guide-tips { border-top: 1px solid var(--line); padding-top: 12px; font-size: 13px; }
+.guide-tips ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); }
+.guide-tips li { margin-bottom: 4px; }
+.guide-tips b { color: var(--text); }

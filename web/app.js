@@ -66,6 +66,8 @@ function render() {
   $('#dirtyCount').textContent = dirty;
   $('#dirtyCount').classList.toggle('hidden', !dirty);
 
+  renderGuide();
+
   $('#nodeRows').innerHTML = S.nodes.map((n) => {
     const st = n.status === 'online' ? '<span class="badge ok">SSH 正常</span>'
       : n.status === 'offline' ? '<span class="badge bad">SSH 不通</span>' : '<span class="badge">未检测</span>';
@@ -166,12 +168,62 @@ function render() {
 const taskBadge = (s) => s === 'running' ? '<span class="badge warn">执行中</span>'
   : s === 'success' ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>';
 
-$('#tabs').addEventListener('click', (e) => {
-  const tab = e.target.dataset.tab;
-  if (!tab) return;
-  document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a === e.target));
+function showTab(tab) {
+  document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
   document.querySelectorAll('main > section').forEach((s) => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
   refresh().catch(() => {});
+}
+$('#tabs').addEventListener('click', (e) => {
+  if (e.target.dataset.tab) showTab(e.target.dataset.tab);
+});
+
+// ---------- 首页教程 ----------
+// 每一步根据当前数据显示是否已完成；全部必做步骤完成后默认收起，用户手动展开 / 收起的选择会被记住。
+function renderGuide() {
+  const installed = S.nodes.filter((n) => n.v2ray_version).length;
+  const inChain = new Set(S.chains.flatMap((c) => c.hops.map((h) => h.node_id)));
+  const synced = S.chains.length > 0 && S.users.length > 0
+    && S.nodes.filter((n) => inChain.has(n.id)).every((n) => n.applied_hash && !n.dirty);
+  const steps = [
+    { done: S.nodes.length > 0, tab: 'nodes', title: '添加节点',
+      text: '在本页点「添加节点」，把每台服务器（如广州、香港、新加坡）都加进来：填写 SSH 地址、用户名和密码（或私钥）。「公网地址」是用户和其它节点连它用的地址；有专线的节点再填「内网地址」。保存后会自动检测 SSH 是否连得上。' },
+    { done: S.nodes.length > 0 && installed === S.nodes.length, tab: 'nodes', title: '安装 v2ray',
+      text: '在每个节点的操作里点「安装」，等任务日志显示完成。节点自己下载不了安装包时，会自动由其它节点代为下载。' },
+    { optional: true, done: S.exits.length > 0, tab: 'exits', title: '添加出口代理',
+      text: '如果希望流量最后从某个 SOCKS5 / HTTP 代理出去，在「出口代理」页添加或批量导入。不需要的话跳过，流量会从线路的最后一个节点直接出网。' },
+    { done: S.chains.length > 0, tab: 'chains', title: '创建线路',
+      text: '在「线路」页点「添加线路」，按顺序选入口、中转、出口节点，并为每一跳选择走内网还是公网（例如广州 → 香港走内网专线，香港 → 新加坡走公网）。线路在每个节点上使用同一个端口，记得在云厂商安全组里放行。' },
+    { done: S.users.length > 0, tab: 'users', title: '添加用户',
+      text: '在「用户」页添加账号，每个用户有独立的凭据。可以限定可用线路，也可以单独指定「最终出口」。' },
+    { done: synced, title: '同步配置',
+      text: '点右上角「同步全部配置」，把线路和用户下发到各节点。之后每次修改都需要再同步一次。' },
+    { done: synced, tab: 'users', title: '把连接信息发给用户',
+      text: '在「用户」页点「连接信息」，把订阅地址或 vmess:// 链接导入 v2rayN、v2rayNG 等客户端即可使用。' },
+    { optional: true, done: !!(S.tls.cert && S.tls.cert.valid), tab: 'settings', title: '给后台配置域名和 HTTPS',
+      text: '后台保存着所有节点的 SSH 密码，建议在「设置」里填写域名并申请证书，之后通过 https://域名:' + (S.tls.https_port || '8443') + ' 访问。境内服务器请选 DNS 验证。' },
+  ];
+  $('#guideSteps').innerHTML = steps.map((s) => `<li class="${s.done ? 'done' : ''}">
+      <span class="mark">${s.done ? '✓' : ''}</span>
+      <div><b>${esc(s.title)}</b>${s.optional ? ' <span class="badge">可选</span>' : ''}
+        ${s.tab && s.tab !== 'nodes' ? `<a data-goto="${s.tab}">前往 →</a>` : ''}
+        <p>${esc(s.text)}</p></div></li>`).join('');
+  const must = steps.filter((s) => !s.optional);
+  const doneCount = must.filter((s) => s.done).length;
+  $('#guideProgress').textContent = doneCount === must.length ? '已完成全部必做步骤' : `已完成 ${doneCount} / ${must.length} 步`;
+  const g = $('#guide');
+  if (!g.dataset.init) {
+    g.dataset.init = '1';
+    let saved = null;
+    try { saved = localStorage.getItem('vcw_guide_open'); } catch { /* 忽略 */ }
+    g.open = saved === null ? doneCount < must.length : saved === '1';
+    g.addEventListener('toggle', () => {
+      try { localStorage.setItem('vcw_guide_open', g.open ? '1' : '0'); } catch { /* 忽略 */ }
+    });
+  }
+}
+document.addEventListener('click', (e) => {
+  const tab = e.target.dataset && e.target.dataset.goto;
+  if (tab) showTab(tab);
 });
 
 // ---------- 对话框 ----------

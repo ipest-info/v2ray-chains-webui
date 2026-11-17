@@ -37,6 +37,21 @@
 
   <main>
     <section id="tab-nodes">
+      <details id="guide" class="card guide">
+        <summary><strong>使用教程</strong><span id="guideProgress" class="muted"></span></summary>
+        <ol id="guideSteps"></ol>
+        <div class="guide-tips">
+          <strong>常用操作</strong>
+          <ul>
+            <li><b>后台连不上某个节点</b>：编辑该节点，在「SSH 跳板」里选一个能连到它的节点（例如广州连不上新加坡，就选「经香港跳转」），「SSH 地址」填跳板能访问到的地址。</li>
+            <li><b>改了任何东西都要同步</b>：修改线路、用户、出口代理或节点配置项后，节点会显示「配置待同步」，点右上角「同步全部配置」才会生效。</li>
+            <li><b>同步后出问题</b>：节点的「备份 / 恢复」里有每次同步前自动保存的配置，可以一键恢复。</li>
+            <li><b>让某个用户换出口</b>：编辑用户，在「最终出口」里选一个出口代理，其它用户不受影响。</li>
+            <li><b>节点连不通</b>：线路页点「检测连通性」逐跳检查；最常见的原因是云厂商安全组没有放行线路端口。</li>
+            <li><b>某个节点需要特殊设置</b>：节点的「配置项」可以改日志级别、DNS，或追加自定义 JSON；「预览配置」查看最终下发的内容。</li>
+          </ul>
+        </div>
+      </details>
       <div class="bar">
         <h2>节点</h2>
         <button class="primary" data-act="node-new">添加节点</button>
