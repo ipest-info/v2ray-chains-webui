@@ -199,6 +199,7 @@ let bwTimer = null;
 let bwRange = '1h';
 let bwData = null;
 const bwIface = {}; // 节点 ID -> 选中的网卡（空 = 合计）
+let bwUser = ''; // 选中的用户（空 = 全部用户合计）
 const BW_SPAN = { '1h': 3600, '24h': 86400, '7d': 604800 };
 
 function fmtRate(v) {
@@ -223,13 +224,54 @@ async function loadBandwidth() {
   if ($('#tab-bandwidth').classList.contains('hidden') || document.hidden) return;
   const q = new URLSearchParams({ range: bwRange });
   Object.entries(bwIface).forEach(([id, name]) => { if (name) q.set('iface.' + id, name); });
+  if (bwUser) q.set('user', bwUser);
   try {
     bwData = await api('GET', '/api/bandwidth?' + q);
     renderBandwidth();
   } catch (err) { /* 下个周期重试 */ }
 }
 
+// 用户流量卡片：所选用户（或全部用户合计）的曲线 + 按区间流量排序的用户表。
+function renderUserBandwidth() {
+  const card = $('#bwUsers');
+  const users = bwData.users;
+  if (bwUser && !users.some((u) => u.name === bwUser)) bwUser = '';
+  const cur = bwUser ? users.filter((u) => u.name === bwUser) : users;
+  const sum = (k) => cur.reduce((s, u) => s + u[k], 0);
+  const set = (k, v) => { card.querySelector(`[data-k=${k}]`).textContent = v; };
+  const live = bwData.user_nodes > 0;
+  set('rx', live ? fmtRate(sum('rx')) : '-');
+  set('tx', live ? fmtRate(sum('tx')) : '-');
+  set('rxb', fmtBytes(sum('rx_bytes')));
+  set('txb', fmtBytes(sum('tx_bytes')));
+  const sel = card.querySelector('select');
+  const opts = '<option value="">全部用户合计</option>' + users.map((u) => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('');
+  if (document.activeElement !== sel && sel.dataset.opts !== opts) {
+    sel.innerHTML = opts;
+    sel.dataset.opts = opts;
+  }
+  if (document.activeElement !== sel) sel.value = bwUser;
+  drawChart(card.querySelector('.bw-chart'), {
+    name: bwUser || '全部用户', points: bwData.user_points, connected: live,
+    error: '还没有入口节点上报用户流量。请先「同步全部配置」（会在入口节点上开启统计），并确认后台能通过 SSH 连上入口节点。',
+  });
+  $('#bwUserRows').innerHTML = users.map((u) => `<tr>
+      <td><strong>${esc(u.name)}</strong>${u.known ? '' : ' <span class="badge">已删除</span>'}</td>
+      <td>${fmtRate(u.rx)}</td><td>${fmtRate(u.tx)}</td>
+      <td>${fmtBytes(u.rx_bytes)}</td><td>${fmtBytes(u.tx_bytes)}</td>
+      <td class="ops"><button class="small" data-bwuser="${esc(u.name)}">${u.name === bwUser ? '查看合计' : '查看曲线'}</button></td>
+    </tr>`).join('') || '<tr><td colspan="6" class="empty">还没有用户</td></tr>';
+}
+$('#bwUsers select').addEventListener('change', (e) => { bwUser = e.target.value; loadBandwidth(); });
+$('#bwUserRows').addEventListener('click', (e) => {
+  const name = e.target.dataset.bwuser;
+  if (name === undefined) return;
+  bwUser = name === bwUser ? '' : name;
+  loadBandwidth();
+});
+
 function renderBandwidth() {
+  renderUserBandwidth();
   const box = $('#bwNodes');
   if (!bwData.nodes.length) {
     box.innerHTML = '<div class="card bw-empty">还没有节点</div>';

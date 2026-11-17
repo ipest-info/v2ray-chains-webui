@@ -13,6 +13,9 @@ import (
 
 type obj = map[string]any
 
+// statsAPIPort 是入口节点上 v2ray 统计接口监听的本机端口。
+const statsAPIPort = 10085
+
 // hopAddr 返回「上一跳访问该节点」时使用的地址。
 func hopAddr(n *Node, kind string) string {
 	if kind == "internal" && n.InternalAddr != "" {
@@ -243,6 +246,20 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 	}
 
 	sort.Ints(ports)
+	// 入口节点开启按用户的流量统计，供带宽监控读取（只监听本机回环地址）。
+	stats := false
+	for _, c := range db.Chains {
+		if len(c.Hops) > 0 && c.Hops[0].NodeID == nodeID && len(inbounds) > 0 {
+			stats = true
+		}
+	}
+	if stats {
+		inbounds = append(inbounds, obj{
+			"tag": "api", "listen": "127.0.0.1", "port": statsAPIPort, "protocol": "dokodemo-door",
+			"settings": obj{"address": "127.0.0.1"},
+		})
+		rules = append([]any{obj{"type": "field", "inboundTag": []string{"api"}, "outboundTag": "api"}}, rules...)
+	}
 	level := conf.LogLevel
 	if level == "" {
 		level = "warning"
@@ -252,6 +269,11 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 		"inbounds":  inbounds,
 		"outbounds": outbounds,
 		"routing":   obj{"domainStrategy": "IPIfNonMatch", "rules": rules},
+	}
+	if stats {
+		cfg["stats"] = obj{}
+		cfg["api"] = obj{"tag": "api", "services": []string{"StatsService"}}
+		cfg["policy"] = obj{"levels": obj{"0": obj{"statsUserUplink": true, "statsUserDownlink": true}}}
 	}
 	if len(conf.DNS) > 0 {
 		cfg["dns"] = obj{"servers": conf.DNS}

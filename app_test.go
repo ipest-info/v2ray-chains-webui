@@ -93,6 +93,9 @@ func TestPerUserExit(t *testing.T) {
 	find := func(rules []any, user string) string {
 		for _, r := range rules {
 			r := r.(obj)
+			if r["outboundTag"] == "api" {
+				continue // 统计接口自身的规则
+			}
 			us, _ := r["user"].([]string)
 			if (user == "" && us == nil && r["ip"] == nil) || (len(us) == 1 && us[0] == user) {
 				return r["outboundTag"].(string)
@@ -445,5 +448,56 @@ func TestBandwidthSampling(t *testing.T) {
 	m.add(t0.Add(65*time.Second), 165, map[string][2]uint64{"eth0": {20, 20}, "lo": {3000, 3000}})
 	if len(m.tiers[1]) != 1 || m.tiers[1][0].R["eth0"].Rx != 5e5 {
 		t.Errorf("1 分钟聚合 = %+v", m.tiers[1])
+	}
+}
+
+func TestUserStats(t *testing.T) {
+	// 入口节点开启统计接口，中转 / 出口节点不开启。
+	db := testDB()
+	gz, _ := configJSON(db, "gz")
+	hk, _ := configJSON(db, "hk")
+	if !strings.Contains(gz, "StatsService") || !strings.Contains(gz, "statsUserUplink") || !strings.Contains(gz, `"port": 10085`) {
+		t.Errorf("入口节点应开启按用户统计:\n%s", gz)
+	}
+	if strings.Contains(hk, "StatsService") {
+		t.Error("非入口节点不应开启统计接口")
+	}
+	if _, ports := configJSON(db, "gz"); len(ports) != 1 {
+		t.Errorf("统计接口端口不应出现在需要放行的端口里: %v", ports)
+	}
+
+	got := parseUserStats(`{
+  "stat": [
+    {"name": "user>>>alice>>>traffic>>>downlink", "value": "5000"},
+    {"name": "user>>>alice>>>traffic>>>uplink", "value": "300"},
+    {"name": "user>>>bob>>>traffic>>>uplink"},
+    {"name": "inbound>>>api>>>traffic>>>uplink", "value": "9"}
+  ]
+}`)
+	if got["alice"] != [2]uint64{5000, 300} || got["bob"] != [2]uint64{0, 0} || len(got) != 2 {
+		t.Errorf("parseUserStats = %v", got)
+	}
+
+	// 两个入口节点上的同一用户应合并。
+	now := time.Now()
+	mk := func(down uint64) *nodeMon {
+		m := newNodeMon("")
+		m.users.add(now.Add(-5*time.Second), 100, map[string][2]uint64{"alice": {0, 0}})
+		m.users.add(now, 105, map[string][2]uint64{"alice": {down, 0}})
+		return m
+	}
+	users, points, reporting := userBandwidth(db, map[string]*nodeMon{"a": mk(625000), "b": mk(625000)}, 0, "")
+	if reporting != 2 || users[0].Name != "alice" || users[0].Rx != 2e6 || !users[0].Known {
+		t.Errorf("users = %+v reporting = %d", users, reporting)
+	}
+	var sum int64
+	for _, p := range points {
+		sum += p[1]
+	}
+	if sum != 2e6 {
+		t.Errorf("points = %v", points)
+	}
+	if _, points, _ = userBandwidth(db, map[string]*nodeMon{"a": mk(625000)}, 0, "bob"); len(points) != 1 || points[0][1] != 0 {
+		t.Errorf("没有流量的用户应得到 0 值曲线: %v", points)
 	}
 }

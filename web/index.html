@@ -114,6 +114,20 @@
         </div>
       </div>
       <p class="hint">各节点网卡的实时上下行速率，每 5 秒采样一次（24 小时视图为 1 分钟平均，7 天视图为 10 分钟平均）。统计的是整台服务器的网卡流量，不只是 v2ray；数据保存在后台内存中，后台重启后重新累积。</p>
+      <div class="card bw" id="bwUsers">
+        <div class="bw-head"><h3>用户流量</h3>
+          <div class="stat"><i style="background:var(--series-rx)"></i>下行（当前）<b data-k="rx">-</b></div>
+          <div class="stat"><i style="background:var(--series-tx)"></i>上行（当前）<b data-k="tx">-</b></div>
+          <div class="stat">区间下行流量<b data-k="rxb">-</b></div>
+          <div class="stat">区间上行流量<b data-k="txb">-</b></div>
+          <select aria-label="用户"></select></div>
+        <div class="bw-chart"></div>
+        <div class="tablewrap" style="margin-top:12px"><table>
+          <thead><tr><th>用户</th><th>当前下行</th><th>当前上行</th><th>区间下行流量</th><th>区间上行流量</th><th></th></tr></thead>
+          <tbody id="bwUserRows"></tbody></table></div>
+        <p class="hint" style="margin:10px 0 0">按用户的流量在线路的入口节点上统计（下行 = 发给用户，上行 = 用户发出）。同一用户走多条线路时合并计算。</p>
+      </div>
+      <h3 style="margin:24px 0 12px">节点网卡</h3>
       <div id="bwNodes"></div>
     </section>
 

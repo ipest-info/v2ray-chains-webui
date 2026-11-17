@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -16,7 +17,9 @@ import (
 
 const (
 	monInterval = 5 // 秒
-	monScript   = `while :; do echo "VCW_T $(cut -d' ' -f1 /proc/uptime)"; cat /proc/net/dev; echo VCW_END; sleep 5; done`
+	// 每个周期输出网卡计数；入口节点上再查询一次 v2ray 的按用户流量统计（其它节点上该查询会立即失败并被忽略）。
+	monScript = `while :; do echo "VCW_T $(cut -d' ' -f1 /proc/uptime)"; cat /proc/net/dev; echo VCW_STATS; ` +
+		`/usr/local/bin/v2ray api stats -s 127.0.0.1:10085 -t 2 -json 'user>>>' 2>/dev/null; echo; echo VCW_END; sleep 5; done`
 )
 
 // 三档精度：5 秒 × 1 小时、1 分钟 × 24 小时、10 分钟 × 7 天。
@@ -68,13 +71,50 @@ type nodeMon struct {
 
 	sig  string // 连接参数的摘要，变化后重连
 	stop chan struct{}
+
+	users *nodeMon // 该节点（作为入口时）按用户的流量，结构相同：Rx = 下行，Tx = 上行
 }
 
 func newNodeMon(sig string) *nodeMon {
-	return &nodeMon{
-		tiers: make([][]monSample, len(monTiers)), buckets: make([]monBucket, len(monTiers)-1),
-		sig: sig, stop: make(chan struct{}),
+	m := newSeries()
+	m.sig, m.stop, m.users = sig, make(chan struct{}), newSeries()
+	return m
+}
+
+func newSeries() *nodeMon {
+	return &nodeMon{tiers: make([][]monSample, len(monTiers)), buckets: make([]monBucket, len(monTiers)-1)}
+}
+
+// parseUserStats 解析 `v2ray api stats -json` 的输出，返回各用户的累计 [下行, 上行] 字节数。
+// 统计项名称形如 user>>>alice>>>traffic>>>downlink；值为 0 时 JSON 中没有 value 字段。
+func parseUserStats(out string) map[string][2]uint64 {
+	var resp struct {
+		Stat []struct {
+			Name  string      `json:"name"`
+			Value json.Number `json:"value"`
+		} `json:"stat"`
 	}
+	res := map[string][2]uint64{}
+	if json.Unmarshal([]byte(out), &resp) != nil {
+		return res
+	}
+	for _, s := range resp.Stat {
+		p := strings.Split(s.Name, ">>>")
+		if len(p) < 4 || p[0] != "user" || p[len(p)-2] != "traffic" {
+			continue
+		}
+		name := strings.Join(p[1:len(p)-2], ">>>")
+		v, _ := strconv.ParseUint(s.Value.String(), 10, 64)
+		cur := res[name]
+		switch p[len(p)-1] {
+		case "downlink":
+			cur[0] = v
+		case "uplink":
+			cur[1] = v
+		}
+		res[name] = cur
+	}
+	return res
 }
 
 // add 记录一次采样：counters 为各网卡的累计收 / 发字节数，up 为节点的开机秒数（单调时钟）。
@@ -134,6 +174,11 @@ func (m *nodeMon) setState(connected bool, msg string) {
 		m.lastBytes = nil // 重连后重新取基准
 	}
 	m.mu.Unlock()
+	if !connected && m.users != nil {
+		m.users.mu.Lock()
+		m.users.lastBytes = nil
+		m.users.mu.Unlock()
+	}
 }
 
 // parseNetDev 解析一段 /proc/net/dev 输出。
@@ -272,16 +317,27 @@ func (mo *Monitor) stream(nodeID string, m *nodeMon) error {
 	m.mu.Unlock()
 
 	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	var up float64
-	var lines []string
+	var lines, stats []string
+	inStats := false
 	for sc.Scan() {
 		line := sc.Text()
 		switch {
 		case strings.HasPrefix(line, "VCW_T "):
 			up, _ = strconv.ParseFloat(strings.TrimSpace(line[6:]), 64)
-			lines = lines[:0]
+			lines, stats, inStats = lines[:0], stats[:0], false
+		case line == "VCW_STATS":
+			inStats = true
 		case line == "VCW_END":
-			m.add(time.Now(), up, parseNetDev(lines))
+			now := time.Now()
+			m.add(now, up, parseNetDev(lines))
+			// 没有输出说明该节点不是入口或尚未同步配置；有输出才记录，哪怕所有用户都是 0。
+			if out := strings.TrimSpace(strings.Join(stats, "\n")); out != "" {
+				m.users.add(now, up, parseUserStats(out))
+			}
+		case inStats:
+			stats = append(stats, line)
 		default:
 			lines = append(lines, line)
 		}
@@ -374,5 +430,87 @@ func (a *App) bandwidth(w http.ResponseWriter, r *http.Request) (any, error) {
 		m.mu.Unlock()
 		out = append(out, v)
 	}
-	return obj{"range": monTiers[tier].name, "step": monTiers[tier].step, "nodes": out}, nil
+	users, userPoints, reporting := userBandwidth(db, mons, tier, r.URL.Query().Get("user"))
+	return obj{
+		"range": monTiers[tier].name, "step": monTiers[tier].step, "nodes": out,
+		"users": users, "user_points": userPoints, "user_nodes": reporting,
+	}, nil
+}
+
+type userBW struct {
+	Name    string  `json:"name"`
+	Known   bool    `json:"known"` // 后台里是否还有这个用户
+	Rx      float64 `json:"rx"`    // 当前下行 bit/s
+	Tx      float64 `json:"tx"`
+	RxBytes float64 `json:"rx_bytes"`
+	TxBytes float64 `json:"tx_bytes"`
+}
+
+// userBandwidth 汇总所有入口节点上的按用户流量。
+// 返回用户列表、所选用户（空 = 全部用户合计）的速率曲线，以及正在上报统计的入口节点数。
+func userBandwidth(db *DB, mons map[string]*nodeMon, tier int, selected string) ([]userBW, [][3]int64, int) {
+	step := monTiers[tier].step
+	byUser := map[string]*userBW{}
+	get := func(name string) *userBW {
+		u := byUser[name]
+		if u == nil {
+			u = &userBW{Name: name}
+			byUser[name] = u
+		}
+		return u
+	}
+	for _, u := range db.Users {
+		get(u.Name).Known = true
+	}
+	series := map[int64]rate{} // 对齐到 step 的时间 -> 所选用户的速率
+	reporting := 0
+	for _, m := range mons {
+		um := m.users
+		um.mu.Lock()
+		if fine := um.tiers[0]; len(fine) > 0 && time.Since(um.updated) < 30*time.Second {
+			reporting++
+			for name, rt := range fine[len(fine)-1].R {
+				u := get(name)
+				u.Rx += rt.Rx
+				u.Tx += rt.Tx
+			}
+		}
+		for _, s := range um.tiers[tier] {
+			t := s.T - s.T%step
+			for name, rt := range s.R {
+				u := get(name)
+				u.RxBytes += rt.Rx / 8 * float64(step)
+				u.TxBytes += rt.Tx / 8 * float64(step)
+				if selected == "" || selected == name {
+					cur := series[t]
+					series[t] = rate{cur.Rx + rt.Rx, cur.Tx + rt.Tx}
+				}
+			}
+			if _, ok := series[t]; !ok {
+				series[t] = rate{} // 该时刻有采样但所选用户没有流量
+			}
+		}
+		um.mu.Unlock()
+	}
+	users := make([]userBW, 0, len(byUser))
+	for _, u := range byUser {
+		users = append(users, *u)
+	}
+	sort.Slice(users, func(i, j int) bool {
+		a, b := users[i].RxBytes+users[i].TxBytes, users[j].RxBytes+users[j].TxBytes
+		if a != b {
+			return a > b
+		}
+		return users[i].Name < users[j].Name
+	})
+	ts := make([]int64, 0, len(series))
+	for t := range series {
+		ts = append(ts, t)
+	}
+	sort.Slice(ts, func(i, j int) bool { return ts[i] < ts[j] })
+	points := make([][3]int64, 0, len(ts))
+	for _, t := range ts {
+		points = append(points, [3]int64{t, int64(series[t].Rx), int64(series[t].Tx)})
+	}
+	return users, points, reporting
 }
