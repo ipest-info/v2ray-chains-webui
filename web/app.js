@@ -566,6 +566,7 @@ function confDialog(n) {
     </div>
     <label class="check"><input type="checkbox" name="sniffing" ${c.sniffing ? 'checked' : ''}>开启流量嗅探（从 HTTP / TLS 中识别域名）</label>
     <label class="check"><input type="checkbox" name="allow_private" ${c.allow_private ? 'checked' : ''}>作为出口时允许访问私有地址段（默认禁止，防止用户访问节点内网）</label>
+    <label class="check"><input type="checkbox" name="no_access_log" ${c.no_access_log ? 'checked' : ''}>不写访问日志（默认每个连接记一条到 /var/log/v2ray/access.log；错误日志始终写入 error.log）</label>
     <label style="margin-top:12px">自定义 JSON（高级，可选）
       <textarea name="extra" class="code" spellcheck="false" placeholder='{"policy": {...}, "inbounds": [...], "outbounds": [...], "routing": {"rules": [...]}}'>${esc(c.extra)}</textarea></label>
     <p class="hint">合并规则：<code>inbounds</code> / <code>outbounds</code> 追加在线路生成的配置之后；<code>routing.rules</code> 插在最前面优先匹配；其它顶层字段（如 <code>policy</code>、<code>dns</code>、<code>log</code>）整体覆盖。保存后用「预览配置」查看结果，再「同步配置」下发。</p>`,
@@ -573,7 +574,7 @@ function confDialog(n) {
     await api('PUT', `/api/nodes/${n.id}/conf`, {
       log_level: f.log_level.value,
       dns: f.dns.value.split(/[,，\s]+/).filter(Boolean),
-      sniffing: f.sniffing.checked, allow_private: f.allow_private.checked, extra: f.extra.value,
+      sniffing: f.sniffing.checked, allow_private: f.allow_private.checked, no_access_log: f.no_access_log.checked, extra: f.extra.value,
     });
   });
 }
@@ -617,6 +618,7 @@ async function backupsDialog(n) {
 async function diagDialog(n) {
   let lines = 200;
   let onlyProblems = false;
+  let file = 'error'; // error = 错误日志（含 systemd 中的启动日志），access = 访问日志
   let data = null;
   const problemRe = /\[(warning|error)\]|fail|error|panic|denied|refused|timeout|invalid/i;
   const mark = { ok: '<span class="badge ok">正常</span>', warn: '<span class="badge warn">注意</span>', bad: '<span class="badge bad">异常</span>' };
@@ -628,8 +630,9 @@ async function diagDialog(n) {
       ${data.hints.map((h) => `<div class="hintbox"><b>${esc(h.title)}</b>${h.count > 1 ? ` <span class="muted">出现 ${h.count} 次</span>` : ''}
           <p>${esc(h.advice)}</p>${h.sample ? `<pre class="log">${esc(h.sample)}</pre>` : ''}</div>`).join('')
         || '<p class="muted">没有发现已知问题。</p>'}
-      <div class="bar" style="margin-top:16px"><h4 style="margin:0">v2ray 日志（最近 ${lines} 行${onlyProblems ? '中的错误 / 警告' : ''}，共 ${logs.length} 行）</h4>
-        <span><label class="check" style="display:inline"><input type="checkbox" data-dg="only" ${onlyProblems ? 'checked' : ''}>只看错误 / 警告</label>
+      <div class="bar" style="margin-top:16px"><h4 style="margin:0">${file === 'access' ? '访问日志 /var/log/v2ray/access.log' : '错误日志 /var/log/v2ray/error.log'}（最近 ${lines} 行${onlyProblems ? '中的错误 / 警告' : ''}，共 ${logs.length} 行${data.log_size ? `；日志目录占用 ${esc(data.log_size)}` : ''}）</h4>
+        <span><button type="button" class="small" data-dg="file">${file === 'access' ? '看错误日志' : '看访问日志'}</button>
+        <label class="check" style="display:inline"><input type="checkbox" data-dg="only" ${onlyProblems ? 'checked' : ''}>只看错误 / 警告</label>
         <button type="button" class="small" data-dg="more">${lines >= 1000 ? '已是最多' : '加载更多'}</button>
         <button type="button" class="small" data-dg="reload">重新检查</button></span></div>
       <pre class="log" id="diagLog">${logs.map((l) => (problemRe.test(l) ? `<span class="logbad">${esc(l)}</span>` : esc(l))).join('\n') || '（没有日志）'}</pre>`;
@@ -639,7 +642,7 @@ async function diagDialog(n) {
   const load = async () => {
     $('#dlgBody').innerHTML = '<p class="muted">正在连接节点并收集信息…</p>';
     try {
-      data = await api('GET', `/api/nodes/${n.id}/diagnose?lines=${lines}`);
+      data = await api('GET', `/api/nodes/${n.id}/diagnose?lines=${lines}&file=${file}`);
       draw();
       refresh().catch(() => {});
     } catch (err) {
@@ -652,6 +655,7 @@ async function diagDialog(n) {
     if (k === 'reload') load();
     if (k === 'more' && lines < 1000) { lines = 1000; load(); }
     if (k === 'only') { onlyProblems = e.target.checked; draw(); }
+    if (k === 'file') { file = file === 'access' ? 'error' : 'access'; onlyProblems = false; load(); }
   };
   await load();
 }

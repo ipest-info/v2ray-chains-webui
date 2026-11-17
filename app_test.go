@@ -571,3 +571,19 @@ func TestUserRateLimit(t *testing.T) {
 		t.Errorf("线路删除后应回收端口: %v", alice.Ports)
 	}
 }
+
+func TestLocalLogFiles(t *testing.T) {
+	db := testDB()
+	for _, id := range []string{"gz", "hk", "sg"} {
+		cfg, _ := buildConfig(db, id)
+		l := cfg["log"].(obj)
+		if l["error"] != "/var/log/v2ray/error.log" || l["access"] != "/var/log/v2ray/access.log" {
+			t.Errorf("%s 应把日志写到本地文件: %v", id, l)
+		}
+	}
+	db.node("hk").Conf.NoAccessLog = true
+	cfg, _ := buildConfig(db, "hk")
+	if l := cfg["log"].(obj); l["access"] != "none" || l["error"] == nil {
+		t.Errorf("关闭访问日志后: %v", l)
+	}
+}

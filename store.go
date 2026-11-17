@@ -42,6 +42,7 @@ type NodeConf struct {
 	DNS          []string `json:"dns"`           // 自定义 DNS 服务器，为空使用系统 DNS
 	Sniffing     bool     `json:"sniffing"`      // 入站流量嗅探（http / tls）
 	AllowPrivate bool     `json:"allow_private"` // 作为出口时允许访问私有地址段
+	NoAccessLog  bool     `json:"no_access_log"` // 不写访问日志（默认每个连接记一条）
 	Extra        string   `json:"extra"`         // 追加 / 覆盖的自定义 JSON
 }
 

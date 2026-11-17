@@ -29,8 +29,15 @@ if [ -x /usr/local/bin/v2ray ] && [ -f /usr/local/etc/v2ray/config.json ]; then
   /usr/local/bin/v2ray test -c /usr/local/etc/v2ray/config.json 2>&1 | tail -n 6
   echo "VCW_TEST_RC=${PIPESTATUS[0]}"
 fi
+echo "VCW_LOGSIZE=$(du -sh /var/log/v2ray 2>/dev/null | cut -f1)"
 echo VCW_LOG_BEGIN
-journalctl -u v2ray -n @LINES@ --no-pager -o short-iso 2>&1
+if [ "@FILE@" = access ]; then
+  tail -n @LINES@ /var/log/v2ray/access.log 2>/dev/null
+else
+  # 启动阶段的报错（配置错误、端口占用等）在日志文件打开之前，只会出现在 systemd 日志里
+  journalctl -u v2ray -n 30 --no-pager -o short-iso -q 2>/dev/null
+  tail -n @LINES@ /var/log/v2ray/error.log 2>/dev/null
+fi
 echo VCW_LOG_END
 `
 
@@ -78,16 +85,17 @@ var problemLineRe = regexp.MustCompile(`(?i)\[(warning|error)\]|fail|error|panic
 var listenPortRe = regexp.MustCompile(`[:\]](\d+)\s`)
 
 // diagnoseNode 收集并分析节点的运行状况。
-func (a *App) diagnoseNode(nodeID string, lines int) (obj, error) {
+func (a *App) diagnoseNode(nodeID string, lines int, file string) (obj, error) {
 	db := a.store.Snapshot()
 	n := db.node(nodeID)
 	if n == nil {
 		return nil, errNotFound
 	}
 	checks := []diagCheck{}
+	logSize := ""
 	add := func(name, status, detail string) { checks = append(checks, diagCheck{name, status, detail}) }
 	result := func(logs []string, hints []diagHint) obj {
-		return obj{"checks": checks, "hints": hints, "logs": logs, "time": time.Now()}
+		return obj{"checks": checks, "hints": hints, "logs": logs, "time": time.Now(), "file": file, "log_size": logSize}
 	}
 
 	conn, _, err := a.connect(nodeID)
@@ -104,7 +112,7 @@ func (a *App) diagnoseNode(nodeID string, lines int) (obj, error) {
 	add("SSH 连接", "ok", "")
 
 	var buf bytes.Buffer
-	script := strings.ReplaceAll(diagnoseScript, "@LINES@", strconv.Itoa(lines))
+	script := strings.NewReplacer("@LINES@", strconv.Itoa(lines), "@FILE@", file).Replace(diagnoseScript)
 	if err := runRootScript(conn.Client, n, script, &buf, 40*time.Second); err != nil {
 		add("收集诊断信息", "bad", err.Error())
 		return result([]string{}, []diagHint{}), nil
@@ -145,6 +153,7 @@ func (a *App) diagnoseNode(nodeID string, lines int) (obj, error) {
 	if logs == nil {
 		logs = []string{}
 	}
+	logSize = kv["VCW_LOGSIZE"]
 	hints := []diagHint{}
 
 	// v2ray 是否安装、是否在运行
@@ -244,6 +253,9 @@ func (a *App) diagnoseNode(nodeID string, lines int) (obj, error) {
 	// 日志里的常见错误
 	found := map[int]*diagHint{}
 	for _, l := range logs {
+		if file == "access" {
+			break // 访问日志只用于查看，不做错误归类
+		}
 		for i, p := range logPatterns {
 			if p.re.MatchString(l) {
 				h := found[i]
@@ -273,5 +285,9 @@ func (a *App) nodeDiagnose(w http.ResponseWriter, r *http.Request) (any, error) 
 	if lines < 50 || lines > 2000 {
 		lines = 200
 	}
-	return a.diagnoseNode(r.PathValue("id"), lines)
+	file := "error"
+	if r.URL.Query().Get("file") == "access" {
+		file = "access"
+	}
+	return a.diagnoseNode(r.PathValue("id"), lines, file)
 }

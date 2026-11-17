@@ -216,7 +216,7 @@ unzip -tq "$ZIP" >/dev/null
 unzip -oq "$ZIP" -d "$TMP"
 systemctl stop v2ray 2>/dev/null || true
 install -m 755 "$TMP/v2ray" /usr/local/bin/v2ray
-mkdir -p /usr/local/share/v2ray /usr/local/etc/v2ray
+mkdir -p /usr/local/share/v2ray /usr/local/etc/v2ray /var/log/v2ray
 install -m 644 "$TMP/geoip.dat" "$TMP/geosite.dat" /usr/local/share/v2ray/
 if [ ! -f /usr/local/etc/v2ray/config.json ]; then
   echo '{"outbounds":[{"protocol":"freedom"}]}' > /usr/local/etc/v2ray/config.json
@@ -380,7 +380,23 @@ export V2RAY_LOCATION_ASSET=/usr/local/share/v2ray
 [ -x /usr/local/bin/v2ray ] || { echo "该节点尚未安装 v2ray，请先执行「安装」"; exit 1; }
 D=/usr/local/etc/v2ray
 B=$D/backups
-mkdir -p "$D"
+mkdir -p "$D" /var/log/v2ray
+# 日志按天轮转、保留 7 份。v2ray 不会重新打开日志文件，所以用 copytruncate。
+if [ -d /etc/logrotate.d ] && [ ! -f /etc/logrotate.d/v2ray-chains ]; then
+  cat > /etc/logrotate.d/v2ray-chains <<'VCW_ROTATE_EOF'
+/var/log/v2ray/*.log {
+    daily
+    rotate 7
+    maxsize 200M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+VCW_ROTATE_EOF
+  chmod 644 /etc/logrotate.d/v2ray-chains
+fi
 umask 077
 backup_config() {
   mkdir -p "$B"
@@ -414,6 +430,7 @@ for p in @PORTS@; do
 done
 restart_v2ray
 echo ">> 配置已生效"
+command -v logrotate >/dev/null 2>&1 || echo "注意：节点上没有安装 logrotate，/var/log/v2ray 下的日志不会自动清理，请留意磁盘空间"
 # 限速规则：有规则要下发，或节点上以前下发过（需要更新 / 清空）时才处理。
 if [ -n "@HASLIMITS@" ] || [ -f "$D/vcw-limits.sh" ]; then
 cat > "$D/vcw-limits.sh" <<'VCW_LIMITS_EOF'

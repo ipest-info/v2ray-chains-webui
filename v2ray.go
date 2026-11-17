@@ -16,6 +16,9 @@ type obj = map[string]any
 // statsAPIPort 是入口节点上 v2ray 统计接口监听的本机端口。
 const statsAPIPort = 10085
 
+// logDir 是节点上 v2ray 日志文件所在目录。
+const logDir = "/var/log/v2ray"
+
 // hopAddr 返回「上一跳访问该节点」时使用的地址。
 func hopAddr(n *Node, kind string) string {
 	if kind == "internal" && n.InternalAddr != "" {
@@ -275,12 +278,17 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 		})
 		rules = append([]any{obj{"type": "field", "inboundTag": []string{"api"}, "outboundTag": "api"}}, rules...)
 	}
+	// 日志写到节点本地文件。访问日志每个连接一条，可在节点配置项里关闭。
+	accessLog := logDir + "/access.log"
+	if conf.NoAccessLog {
+		accessLog = "none"
+	}
 	level := conf.LogLevel
 	if level == "" {
 		level = "warning"
 	}
 	cfg := obj{
-		"log":       obj{"loglevel": level},
+		"log":       obj{"loglevel": level, "error": logDir + "/error.log", "access": accessLog},
 		"inbounds":  inbounds,
 		"outbounds": outbounds,
 		"routing":   obj{"domainStrategy": "IPIfNonMatch", "rules": rules},
