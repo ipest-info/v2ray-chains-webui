@@ -1,0 +1,23 @@
+# 启动： cp .env.example .env && 修改 .env && docker compose up -d --build
+services:
+  webui:
+    build:
+      context: .
+      args:
+        # 境内构建拉取 Go 依赖较慢时，在 .env 中设置 GOPROXY=https://goproxy.cn,direct
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+    image: v2ray-chains-webui:latest
+    container_name: v2ray-chains-webui
+    restart: unless-stopped
+    # 使用宿主机网络：后台可以直接用 127.0.0.1 SSH 管理本机，
+    # 也能直接走宿主机的专线内网路由访问其它节点。
+    network_mode: host
+    command: ["-listen", "${LISTEN:-:8080}"]
+    environment:
+      # 仅在首次启动（data 目录为空）时用于初始化管理员账号
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请在 .env 中设置 ADMIN_PASSWORD（至少 8 位）}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 保存节点 SSH 凭据、线路和用户数据，请妥善保管并备份
+      - ./data:/data

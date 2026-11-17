@@ -46,6 +46,18 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o v2ray-chains-webui .
 ADMIN_USER=admin ADMIN_PASSWORD='至少8位的强密码' ./v2ray-chains-webui -listen :8080 -data ./data
 ```
 
+### Docker Compose
+
+```bash
+cp .env.example .env   # 填写 ADMIN_PASSWORD（至少 8 位）
+docker compose up -d --build
+```
+
+容器使用宿主机网络（`network_mode: host`），因此可以用 `127.0.0.1` SSH 管理本机，并直接走宿主机的专线内网访问其它节点。
+数据保存在 `./data`。监听地址用 `.env` 里的 `LISTEN` 修改；境内构建较慢时设置 `GOPROXY=https://goproxy.cn,direct`。
+
+### systemd
+
 作为服务运行可参考 [`deploy/v2ray-chains-webui.service`](deploy/v2ray-chains-webui.service)。
 
 | 参数 | 说明 |
