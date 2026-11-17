@@ -16,6 +16,7 @@
 - **节点配置项**：每个节点可单独设置日志级别、DNS、流量嗅探、是否允许访问私有地址，并可填写自定义 JSON 合并进最终配置。
 - **配置备份 / 恢复**：每次同步或恢复前自动备份节点上的当前配置（保留最近 30 份），页面上可查看、恢复、手动备份。
 - **出口代理**：线路末端节点之后可以再接一个 SOCKS5 / HTTP 代理作为最终出口；既可设为线路默认出口，也可单独指定给某个用户。
+- **后台域名与 HTTPS 证书**：在「设置」里填写域名，用 acme.sh 一键申请证书，后台随即在 `8443` 端口提供 HTTPS，到期前自动续期。
 - **安装包中转**：节点自己下载 v2ray 失败时（境内访问 GitHub 不通），自动改由其它节点下载后经 SSH 中转过去。
 
 ## 典型场景：广州 →（专线内网）→ 香港 →（公网）→ 新加坡
@@ -57,7 +58,7 @@ docker compose up -d --build
 ```
 
 容器使用宿主机网络（`network_mode: host`），因此可以用 `127.0.0.1` SSH 管理本机，并直接走宿主机的专线内网访问其它节点。
-数据保存在 `./data`。监听地址用 `.env` 里的 `LISTEN` 修改；境内构建较慢时设置 `GOPROXY=https://goproxy.cn,direct`。
+数据保存在 `./data`。监听地址用 `.env` 里的 `LISTEN`（HTTP，默认 `:8080`）和 `HTTPS_LISTEN`（HTTPS，默认 `:8443`）修改；境内构建较慢时设置 `GOPROXY=https://goproxy.cn,direct`。
 
 ### systemd
 
@@ -67,8 +68,30 @@ docker compose up -d --build
 | --- | --- |
 | `-listen` | 监听地址，默认 `:8080` |
 | `-data` | 数据目录，默认 `./data` |
-| `-tls-cert` / `-tls-key` | 启用 HTTPS |
+| `-https-listen` | HTTPS 监听地址，默认 `:8443`，使用后台里通过 acme.sh 申请的证书；留空则不启用 |
+| `-tls-cert` / `-tls-key` | 手动指定证书，此时 `-listen` 直接提供 HTTPS，不再启用 `-https-listen` |
 | `-reset-admin` | 忘记密码时重置管理员账号（读取 `ADMIN_USER` / `ADMIN_PASSWORD`）后退出 |
+
+## 域名与 HTTPS 证书（acme.sh）
+
+1. 把域名解析到后台所在机器的公网 IP，放行 `8443` 端口。
+2. 先用 `http://IP:8080` 登录，在「设置 → 后台域名与 HTTPS 证书」填写域名，选择验证方式，点「申请 / 续期证书」。
+3. 成功后访问 `https://域名:8443`，无需重启。可勾选「把 HTTP 访问自动跳转到 HTTPS」。
+
+两种验证方式：
+
+- **HTTP 验证**：申请时后台临时监听本机 `80` 端口供证书机构访问。要求 80 端口空闲且公网可达。
+- **DNS 验证**：通过 DNS 服务商 API 自动添加 TXT 记录，不需要 80 端口。填写 acme.sh 的 dnsapi 名称
+  （如 `dns_ali`、`dns_dp`、`dns_cf`）和对应的凭据环境变量（如 `Ali_Key=...`、`Ali_Secret=...`，
+  变量名见 [acme.sh dnsapi 文档](https://github.com/acmesh-official/acme.sh/wiki/dnsapi)）。
+  **境内服务器的 80 端口对未备案域名通常不通，请用这种方式。**
+
+说明：
+
+- acme.sh 在首次申请时自动下载到 `data/acme/`（固定版本 3.1.1），后台所在机器需要有 `curl` 和 `openssl`（Docker 镜像已内置）。
+  访问不了 GitHub 时可在页面上更换下载地址，或手动把 `acme.sh`（及 `dnsapi/dns_xxx.sh`）放进 `data/acme/`。
+- 证书保存在 `data/tls/`。后台每 12 小时检查一次，剩余不足 30 天时自动续期。
+- DNS API 凭据明文保存在 `data/data.json`，接口不回传。建议使用只有 DNS 解析权限的子账号密钥。
 
 ## 工作方式
 
@@ -91,7 +114,7 @@ docker compose up -d --build
 
 ## 安全说明
 
-- 后台掌握所有节点的 SSH 凭据，**务必启用 HTTPS**（`-tls-cert` / `-tls-key` 或放在 HTTPS 反向代理之后），
+- 后台掌握所有节点的 SSH 凭据，**务必启用 HTTPS**（按上文用 acme.sh 申请证书，或 `-tls-cert` / `-tls-key`，或放在 HTTPS 反向代理之后），
   并尽量用防火墙限制可访问后台的来源 IP。
 - SSH 密码 / 私钥、出口代理密码以明文保存在 `data/data.json`（权限 0600），请保护好该文件及其备份；接口不会返回这些凭据。
 - SSH 主机公钥在首次连接时记录，之后不一致会拒绝连接；服务器重装后在节点列表点「重置主机公钥」即可重新记录。

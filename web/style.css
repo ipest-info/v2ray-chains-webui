@@ -89,3 +89,4 @@ textarea.code { min-height: 180px; font-family: ui-monospace, SFMono-Regular, Me
 .backup { display: flex; gap: 8px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .backup:last-child { border-bottom: 0; }
 .backup .mono { flex: 1; }
+a { color: var(--accent); }

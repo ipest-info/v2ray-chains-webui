@@ -1,7 +1,7 @@
 'use strict';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-let S = { nodes: [], chains: [], exits: [], users: [], tasks: [], settings: {}, admin: '' };
+let S = { nodes: [], chains: [], exits: [], users: [], tasks: [], settings: {}, tls: { dns_env_keys: [], cert: {} }, admin: '' };
 
 async function api(method, path, body) {
   const res = await fetch(path, {
@@ -136,6 +136,26 @@ function render() {
       <td>${esc(fmtTime(t.started_at))}</td>
       <td class="ops"><button class="small" data-act="task-view" data-id="${t.id}">查看日志</button></td>
     </tr>`).join('') || '<tr><td colspan="4" class="empty">暂无任务</td></tr>';
+
+  const tf = $('#tlsForm');
+  const T = S.tls;
+  if (!tf.contains(document.activeElement)) {
+    tf.domain.value = T.domain || '';
+    tf.email.value = T.email || '';
+    tf.ca.value = T.ca || 'letsencrypt';
+    tf.mode.value = T.mode || 'http';
+    tf.dns_provider.value = T.dns_provider || '';
+    tf.redirect.checked = !!T.redirect;
+    tf.acme_base_url.value = T.acme_base_url || '';
+    $('#tlsDns').classList.toggle('hidden', tf.mode.value !== 'dns');
+  }
+  $('#tlsEnvKeys').textContent = T.dns_env_keys.length ? `（已保存：${T.dns_env_keys.join('、')}；留空则不修改）` : '';
+  const url = T.domain && T.https_port ? `https://${T.domain}:${T.https_port}/` : '';
+  $('#tlsStatus').innerHTML = !T.https_port ? '<span class="badge">HTTPS 入口未启用</span>'
+    : !T.cert.loaded ? `<span class="badge">尚未申请证书</span> <span class="muted">HTTPS 端口 ${esc(T.https_port)}</span>`
+      : `<span class="badge ${T.cert.valid ? 'ok' : 'bad'}">${T.cert.valid ? '证书有效' : '证书已过期'}</span>
+         ${esc(T.cert.domains.join(', '))}，${esc(T.cert.issuer)} 签发，${esc(new Date(T.cert.not_after).toLocaleDateString())} 到期
+         ${url ? `<br><a href="${esc(url)}">${esc(url)}</a>` : ''}`;
 
   const sf = $('#settingsForm');
   if (document.activeElement !== sf.download_url) sf.download_url.value = S.settings.download_url || '';
@@ -511,6 +531,26 @@ $('#settingsForm').addEventListener('submit', async (e) => {
     toast('已保存');
     await refresh();
   } catch (err) { toast(err.message); }
+});
+
+$('#tlsForm').mode.addEventListener('change', (e) => $('#tlsDns').classList.toggle('hidden', e.target.value !== 'dns'));
+async function saveTLS() {
+  const f = $('#tlsForm');
+  await api('PUT', '/api/tls', {
+    domain: f.domain.value, email: f.email.value, ca: f.ca.value, mode: f.mode.value,
+    dns_provider: f.dns_provider.value, dns_env_text: f.dns_env_text.value,
+    redirect: f.redirect.checked, acme_base_url: f.acme_base_url.value,
+  });
+  f.dns_env_text.value = '';
+  document.activeElement.blur();
+  await refresh();
+}
+$('#tlsForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try { await saveTLS(); toast('已保存'); } catch (err) { toast(err.message); }
+});
+$('#tlsIssue').addEventListener('click', async () => {
+  try { await saveTLS(); await startTask('/api/tls/issue'); } catch (err) { toast(err.message); }
 });
 
 $('#passwordForm').addEventListener('submit', async (e) => {

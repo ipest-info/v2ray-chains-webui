@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,11 @@ type App struct {
 	store *Store
 	auth  *Auth
 	tasks *Tasks
+
+	dataDir   string
+	certs     *certManager
+	httpsPort string // HTTPS 监听端口，空表示未启用
+	acmeMu    sync.Mutex
 }
 
 type apiError struct {
@@ -97,6 +103,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /api/state", a.api(a.state))
 	mux.HandleFunc("POST /api/password", a.api(a.changePassword))
 	mux.HandleFunc("PUT /api/settings", a.api(a.saveSettings))
+	mux.HandleFunc("PUT /api/tls", a.api(a.saveTLS))
+	mux.HandleFunc("POST /api/tls/issue", a.api(a.tlsIssue))
 
 	mux.HandleFunc("POST /api/nodes", a.api(a.saveNode))
 	mux.HandleFunc("PUT /api/nodes/{id}", a.api(a.saveNode))
@@ -201,7 +209,9 @@ func (a *App) changePassword(w http.ResponseWriter, r *http.Request) (any, error
 }
 
 func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) (any, error) {
-	var in Settings
+	var in struct {
+		DownloadURL string `json:"download_url"`
+	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
 	}
@@ -212,7 +222,7 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) (any, error) 
 	if !strings.HasPrefix(in.DownloadURL, "https://") && !strings.HasPrefix(in.DownloadURL, "http://") {
 		return nil, bad("下载地址必须以 http(s):// 开头")
 	}
-	return nil, a.store.Update(func(db *DB) error { db.Settings = in; return nil })
+	return nil, a.store.Update(func(db *DB) error { db.Settings.DownloadURL = in.DownloadURL; return nil })
 }
 
 // ---------- 总览 ----------
@@ -270,7 +280,8 @@ func (a *App) state(w http.ResponseWriter, r *http.Request) (any, error) {
 	}
 	return obj{
 		"admin":    db.Admin.Username,
-		"settings": db.Settings,
+		"settings": obj{"download_url": db.Settings.DownloadURL},
+		"tls":      a.tlsState(db.Settings.TLS),
 		"nodes":    nodes,
 		"chains":   db.Chains,
 		"exits":    exits,

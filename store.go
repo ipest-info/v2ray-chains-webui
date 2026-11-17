@@ -94,7 +94,8 @@ type Admin struct {
 }
 
 type Settings struct {
-	DownloadURL string `json:"download_url"`
+	DownloadURL string      `json:"download_url"`
+	TLS         TLSSettings `json:"tls"`
 }
 
 const defaultDownloadURL = "https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-{arch}.zip"
