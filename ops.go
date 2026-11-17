@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -370,29 +373,168 @@ func pipeDownload(src, dst *sshConn, url, zip string) error {
 	return errors.Join(serr, cerr, derr)
 }
 
-const applyScript = `
+// scriptHead 是同步 / 备份 / 恢复脚本的公共部分。备份保存在节点上，最多保留 30 份。
+const scriptHead = `
 set -e
 export V2RAY_LOCATION_ASSET=/usr/local/share/v2ray
 [ -x /usr/local/bin/v2ray ] || { echo "该节点尚未安装 v2ray，请先执行「安装」"; exit 1; }
 D=/usr/local/etc/v2ray
+B=$D/backups
 mkdir -p "$D"
 umask 077
+backup_config() {
+  mkdir -p "$B"
+  name="config-$(date +%Y%m%d-%H%M%S).json"
+  cp -p "$D/config.json" "$B/$name"
+  ls -1 "$B" | grep -E '^config-[0-9]{8}-[0-9]{6}\.json$' | sort -r | tail -n +31 | while read -r f; do rm -f "$B/$f"; done
+  echo ">> 已备份当前配置: $name"
+}
+restart_v2ray() {
+  systemctl restart v2ray
+  sleep 1
+  systemctl is-active --quiet v2ray || { echo "v2ray 启动失败:"; journalctl -u v2ray -n 20 --no-pager 2>/dev/null; exit 1; }
+}
+`
+
+const applyScript = scriptHead + `
 cat > "$D/config.new.json" <<'VCW_CONFIG_EOF'
-%s
+@CONFIG@
 VCW_CONFIG_EOF
 /usr/local/bin/v2ray test -c "$D/config.new.json" >/dev/null || { echo "配置校验未通过，已保留原配置"; exit 1; }
+# 覆盖前先备份当前配置（内容没有变化时不重复备份）
+if [ -f "$D/config.json" ] && ! cmp -s "$D/config.json" "$D/config.new.json"; then
+  backup_config
+fi
 mv -f "$D/config.new.json" "$D/config.json"
-for p in %s; do
+for p in @PORTS@; do
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then ufw allow "$p/tcp" >/dev/null; fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd -q --permanent --add-port="$p/tcp" && firewall-cmd -q --add-port="$p/tcp"
   fi
 done
-systemctl restart v2ray
-sleep 1
-systemctl is-active --quiet v2ray || { echo "v2ray 启动失败:"; journalctl -u v2ray -n 20 --no-pager 2>/dev/null; exit 1; }
+restart_v2ray
 echo ">> 配置已生效"
 `
+
+const backupNowScript = scriptHead + `
+[ -f "$D/config.json" ] || { echo "节点上还没有配置文件"; exit 1; }
+backup_config
+`
+
+// 恢复前同样先备份当前配置；备份文件校验不通过则不动现有配置。
+const restoreScript = scriptHead + `
+F="$B/@NAME@"
+[ -f "$F" ] || { echo "备份文件不存在"; exit 1; }
+cp -p "$F" "$D/config.new.json"
+/usr/local/bin/v2ray test -c "$D/config.new.json" >/dev/null || { rm -f "$D/config.new.json"; echo "备份文件校验未通过，已保留当前配置"; exit 1; }
+if [ -f "$D/config.json" ] && ! cmp -s "$D/config.json" "$D/config.new.json"; then
+  backup_config
+fi
+mv -f "$D/config.new.json" "$D/config.json"
+restart_v2ray
+echo ">> 已恢复备份并重启 v2ray"
+`
+
+const listBackupsScript = `
+B=/usr/local/etc/v2ray/backups
+[ -d "$B" ] || exit 0
+cd "$B"
+for f in config-*.json; do [ -f "$f" ] && echo "VCW_BACKUP $f $(stat -c %s "$f")"; done
+exit 0
+`
+
+var backupNameRe = regexp.MustCompile(`^config-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.json$`)
+
+type backupInfo struct {
+	Name string `json:"name"`
+	Time string `json:"time"` // 节点本地时间
+	Size int    `json:"size"`
+}
+
+// listBackups 列出节点上的配置备份，最新的在前。
+func (a *App) listBackups(nodeID string) ([]backupInfo, error) {
+	conn, db, err := a.connect(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	var buf bytes.Buffer
+	if err := runRootScript(conn.Client, db.node(nodeID), listBackupsScript, &buf, 30*time.Second); err != nil {
+		return nil, fmt.Errorf("读取备份列表失败: %w: %s", err, strings.TrimSpace(buf.String()))
+	}
+	out := []backupInfo{}
+	for _, line := range strings.Split(buf.String(), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 || f[0] != "VCW_BACKUP" {
+			continue
+		}
+		m := backupNameRe.FindStringSubmatch(f[1])
+		if m == nil {
+			continue
+		}
+		size, _ := strconv.Atoi(f[2])
+		out = append(out, backupInfo{Name: f[1], Size: size,
+			Time: fmt.Sprintf("%s-%s-%s %s:%s:%s", m[1], m[2], m[3], m[4], m[5], m[6])})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name > out[j].Name })
+	return out, nil
+}
+
+// readBackup 读取一份备份的内容。
+func (a *App) readBackup(nodeID, name string) (string, error) {
+	conn, db, err := a.connect(nodeID)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	var buf bytes.Buffer
+	script := "cat /usr/local/etc/v2ray/backups/" + name + "\n"
+	if err := runRootScript(conn.Client, db.node(nodeID), script, &buf, 30*time.Second); err != nil {
+		return "", fmt.Errorf("读取备份失败: %w: %s", err, strings.TrimSpace(buf.String()))
+	}
+	return buf.String(), nil
+}
+
+// backupNode 立即备份节点上的当前配置。
+func (a *App) backupNode(t *Task, nodeID string) error {
+	l := a.tasks.nodeLock(nodeID)
+	l.Lock()
+	defer l.Unlock()
+	conn, db, err := a.connect(nodeID)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return runRootScript(conn.Client, db.node(nodeID), backupNowScript, t, time.Minute)
+}
+
+// restoreNode 把节点配置恢复为指定备份并重启 v2ray。
+func (a *App) restoreNode(t *Task, nodeID, name string) error {
+	l := a.tasks.nodeLock(nodeID)
+	l.Lock()
+	defer l.Unlock()
+	conn, db, err := a.connect(nodeID)
+	if err != nil {
+		a.markOffline(nodeID, err)
+		return err
+	}
+	defer conn.Close()
+	t.logf("恢复备份 %s", name)
+	if err := runRootScript(conn.Client, db.node(nodeID), strings.ReplaceAll(restoreScript, "@NAME@", name), t, 2*time.Minute); err != nil {
+		return fmt.Errorf("恢复失败: %w", err)
+	}
+	t.logf("注意：节点现在运行的是备份中的配置，与后台当前数据可能不一致；再次「同步配置」会用后台数据覆盖它")
+	ver, active := probe(conn)
+	return a.store.Update(func(d *DB) error {
+		if n := d.node(nodeID); n != nil {
+			// 记为与后台生成的配置不同，页面上显示「配置待同步」。
+			n.AppliedHash, n.AppliedAt = "restored:"+name, time.Now()
+			n.Status, n.StatusMsg, n.CheckedAt = "online", "", time.Now()
+			n.V2rayVersion, n.ServiceActive = ver, active
+		}
+		return nil
+	})
+}
 
 // applyNode 把当前配置同步到节点并重启 v2ray。
 func (a *App) applyNode(t *Task, nodeID string) error {
@@ -429,7 +571,7 @@ func (a *App) applyOn(t *Task, conn *sshConn, nodeID string) error {
 		ps[i] = strconv.Itoa(p)
 	}
 	t.logf("同步配置到「%s」（监听端口: %s）", n.Name, strings.Join(ps, " "))
-	if err := runRootScript(conn.Client, n, fmt.Sprintf(applyScript, cfg, strings.Join(ps, " ")), t, 2*time.Minute); err != nil {
+	if err := runRootScript(conn.Client, n, strings.NewReplacer("@CONFIG@", cfg, "@PORTS@", strings.Join(ps, " ")).Replace(applyScript), t, 2*time.Minute); err != nil {
 		return fmt.Errorf("同步配置失败: %w", err)
 	}
 	ver, active := probe(conn)

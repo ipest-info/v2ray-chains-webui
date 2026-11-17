@@ -1,7 +1,7 @@
 'use strict';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-let S = { nodes: [], chains: [], users: [], tasks: [], settings: {}, admin: '' };
+let S = { nodes: [], chains: [], exits: [], users: [], tasks: [], settings: {}, admin: '' };
 
 async function api(method, path, body) {
   const res = await fetch(path, {
@@ -28,6 +28,7 @@ function toast(msg) {
 }
 const fmtTime = (s) => (s && !s.startsWith('0001') ? new Date(s).toLocaleString() : '');
 const nodeName = (id) => (S.nodes.find((n) => n.id === id) || {}).name || '?';
+const exitName = (id) => (S.exits.find((x) => x.id === id) || {}).name || '?';
 
 // ---------- 登录 ----------
 function showLogin() {
@@ -81,7 +82,9 @@ function render() {
         <button class="small" data-act="node-check" data-id="${n.id}">检测</button>
         <button class="small" data-act="node-install" data-id="${n.id}">${n.v2ray_version ? '重装 / 升级' : '安装'}</button>
         <button class="small" data-act="node-apply" data-id="${n.id}">同步配置</button>
-        <button class="small" data-act="node-config" data-id="${n.id}">查看配置</button>
+        <button class="small" data-act="node-conf" data-id="${n.id}">配置项</button>
+        <button class="small" data-act="node-config" data-id="${n.id}">预览配置</button>
+        <button class="small" data-act="node-backups" data-id="${n.id}">备份 / 恢复</button>
         <button class="small" data-act="node-edit" data-id="${n.id}">编辑</button>
         ${n.has_host_key ? `<button class="small" data-act="node-hostkey" data-id="${n.id}">重置主机公钥</button>` : ''}
         <button class="small danger" data-act="node-del" data-id="${n.id}">删除</button>
@@ -90,7 +93,7 @@ function render() {
 
   $('#chainRows').innerHTML = S.chains.map((c) => `<tr>
       <td><strong>${esc(c.name)}</strong></td>
-      <td>用户 ${c.hops.map((h, i) => `→ ${i > 0 ? `<span class="badge">${h.addr === 'internal' ? '内网' : '公网'}</span> ` : ''}${esc(nodeName(h.node_id))}`).join(' ')} → 互联网</td>
+      <td>用户 ${c.hops.map((h, i) => `→ ${i > 0 ? `<span class="badge">${h.addr === 'internal' ? '内网' : '公网'}</span> ` : ''}${esc(nodeName(h.node_id))}`).join(' ')} → ${c.exit_id ? `<span class="badge warn">${esc(exitName(c.exit_id))}</span> → ` : ''}互联网</td>
       <td class="mono">${c.port}</td>
       <td class="ops">
         <button class="small" data-act="chain-test" data-id="${c.id}">检测连通性</button>
@@ -98,10 +101,26 @@ function render() {
         <button class="small danger" data-act="chain-del" data-id="${c.id}">删除</button>
       </td></tr>`).join('') || '<tr><td colspan="4" class="empty">还没有线路</td></tr>';
 
+  $('#exitRows').innerHTML = S.exits.map((x) => {
+    const chains = S.chains.filter((c) => c.exit_id === x.id).map((c) => c.name);
+    const users = S.users.filter((u) => u.exit_id === x.id).map((u) => u.name);
+    return `<tr>
+      <td><strong>${esc(x.name)}</strong></td>
+      <td>${x.protocol === 'socks' ? 'SOCKS5' : 'HTTP'}</td>
+      <td class="mono">${esc(x.address)}:${x.port}</td>
+      <td>${x.username ? esc(x.username) : '<span class="muted">无</span>'}</td>
+      <td>${chains.length ? `线路：${esc(chains.join('、'))}` : ''}${chains.length && users.length ? '<br>' : ''}${users.length ? `用户：${esc(users.join('、'))}` : ''}${!chains.length && !users.length ? '<span class="muted">未使用</span>' : ''}</td>
+      <td class="ops">
+        <button class="small" data-act="exit-edit" data-id="${x.id}">编辑</button>
+        <button class="small danger" data-act="exit-del" data-id="${x.id}">删除</button>
+      </td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="empty">还没有出口代理（不配置时，流量从线路末端节点直接出网）</td></tr>';
+
   $('#userRows').innerHTML = S.users.map((u) => `<tr>
       <td><strong>${esc(u.name)}</strong></td>
       <td><span class="badge ${u.enabled ? 'ok' : 'bad'}">${u.enabled ? '启用' : '停用'}</span></td>
       <td>${u.chain_ids.length ? u.chain_ids.map((id) => esc((S.chains.find((c) => c.id === id) || {}).name || '?')).join('、') : '全部线路'}</td>
+      <td>${!u.exit_id ? '<span class="muted">跟随线路</span>' : u.exit_id === 'direct' ? '末端节点直连' : `<span class="badge warn">${esc(exitName(u.exit_id))}</span>`}</td>
       <td>${esc(u.remark)}</td>
       <td class="ops">
         <button class="small" data-act="user-links" data-id="${u.id}">连接信息</button>
@@ -109,7 +128,7 @@ function render() {
         <button class="small" data-act="user-edit" data-id="${u.id}">编辑</button>
         <button class="small" data-act="user-reset" data-id="${u.id}">重置凭据</button>
         <button class="small danger" data-act="user-del" data-id="${u.id}">删除</button>
-      </td></tr>`).join('') || '<tr><td colspan="5" class="empty">还没有用户</td></tr>';
+      </td></tr>`).join('') || '<tr><td colspan="6" class="empty">还没有用户</td></tr>';
 
   $('#taskRows').innerHTML = S.tasks.map((t) => `<tr>
       <td>${esc(t.title)}</td>
@@ -140,6 +159,7 @@ let dlgSubmit = null;
 let dlgTimer = null;
 function openDialog(title, html, onSubmit, okText = '保存') {
   $('#dlgTitle').textContent = title;
+  $('#dlgBody').onclick = null;
   $('#dlgBody').innerHTML = html;
   $('#dlgErr').textContent = '';
   $('#dlgOk').textContent = okText;
@@ -237,6 +257,93 @@ function nodeDialog(n) {
   });
 }
 
+// 节点的 v2ray 配置项。
+function confDialog(n) {
+  const c = n.conf || {};
+  const level = c.log_level || 'warning';
+  openDialog(`「${n.name}」的 v2ray 配置项`, `
+    <div class="row">
+      <label>日志级别<select name="log_level">${['debug', 'info', 'warning', 'error', 'none']
+    .map((l) => `<option ${l === level ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label>DNS 服务器（逗号分隔，留空使用系统 DNS）<input name="dns" value="${esc((c.dns || []).join(', '))}" placeholder="8.8.8.8, 1.1.1.1"></label>
+    </div>
+    <label class="check"><input type="checkbox" name="sniffing" ${c.sniffing ? 'checked' : ''}>开启流量嗅探（从 HTTP / TLS 中识别域名）</label>
+    <label class="check"><input type="checkbox" name="allow_private" ${c.allow_private ? 'checked' : ''}>作为出口时允许访问私有地址段（默认禁止，防止用户访问节点内网）</label>
+    <label style="margin-top:12px">自定义 JSON（高级，可选）
+      <textarea name="extra" class="code" spellcheck="false" placeholder='{"policy": {...}, "inbounds": [...], "outbounds": [...], "routing": {"rules": [...]}}'>${esc(c.extra)}</textarea></label>
+    <p class="hint">合并规则：<code>inbounds</code> / <code>outbounds</code> 追加在线路生成的配置之后；<code>routing.rules</code> 插在最前面优先匹配；其它顶层字段（如 <code>policy</code>、<code>dns</code>、<code>log</code>）整体覆盖。保存后用「预览配置」查看结果，再「同步配置」下发。</p>`,
+  async (f) => {
+    await api('PUT', `/api/nodes/${n.id}/conf`, {
+      log_level: f.log_level.value,
+      dns: f.dns.value.split(/[,，\s]+/).filter(Boolean),
+      sniffing: f.sniffing.checked, allow_private: f.allow_private.checked, extra: f.extra.value,
+    });
+  });
+}
+
+// 节点上的配置备份：查看、恢复、立即备份。
+async function backupsDialog(n) {
+  openDialog(`「${n.name}」的配置备份`, '<p class="muted">正在读取…</p>', null);
+  let list;
+  try {
+    list = (await api('GET', `/api/nodes/${n.id}/backups`)).backups;
+  } catch (err) {
+    $('#dlgBody').innerHTML = `<p class="err">${esc(err.message)}</p>`;
+    return;
+  }
+  $('#dlgBody').innerHTML = `
+    <p class="hint">每次同步或恢复配置前，节点上的当前配置会自动备份到 <code>/usr/local/etc/v2ray/backups/</code>（保留最近 30 份，时间为节点本地时间）。</p>
+    <p><button type="button" class="small" data-bk="create">立即备份当前配置</button></p>
+    ${list.map((b) => `<div class="backup"><span class="mono">${esc(b.time)}</span><span class="muted">${b.size} 字节</span>
+      <button type="button" class="small" data-bk="view" data-name="${esc(b.name)}">查看</button>
+      <button type="button" class="small" data-bk="restore" data-name="${esc(b.name)}">恢复</button></div>`).join('') || '<p class="muted">还没有备份</p>'}
+    <pre class="log hidden" id="bkView" style="margin-top:12px"></pre>`;
+  $('#dlgBody').onclick = async (e) => {
+    const { bk, name } = e.target.dataset;
+    if (!bk) return;
+    try {
+      if (bk === 'create') return await startTask(`/api/nodes/${n.id}/backups`);
+      if (bk === 'view') {
+        const r = await api('GET', `/api/nodes/${n.id}/backups/${name}`);
+        $('#bkView').textContent = r.config;
+        $('#bkView').classList.remove('hidden');
+        return;
+      }
+      if (bk === 'restore' && confirm(`把「${n.name}」的配置恢复为 ${name} 并重启 v2ray？\n当前配置会先自动备份。恢复后节点配置与后台数据可能不一致，再次同步会被后台数据覆盖。`)) {
+        await startTask(`/api/nodes/${n.id}/backups/${name}/restore`);
+      }
+    } catch (err) { toast(err.message); }
+  };
+}
+
+// ---------- 出口代理 ----------
+function exitDialog(x) {
+  const edit = !!x;
+  x = x || { protocol: 'socks', port: 1080 };
+  openDialog(edit ? '编辑出口代理' : '添加出口代理', `
+    <div class="row">
+      <label>名称<input name="name" value="${esc(x.name)}" placeholder="例如：美国住宅代理" required></label>
+      <label>协议<select name="protocol">
+        <option value="socks" ${x.protocol === 'socks' ? 'selected' : ''}>SOCKS5</option>
+        <option value="http" ${x.protocol === 'http' ? 'selected' : ''}>HTTP</option></select></label>
+    </div>
+    <div class="row">
+      <label>代理地址<input name="address" value="${esc(x.address)}" placeholder="IP 或域名" required></label>
+      <label>端口<input name="port" type="number" min="1" max="65535" value="${x.port}" required></label>
+    </div>
+    <div class="row">
+      <label>用户名（可选）<input name="username" value="${esc(x.username)}" autocomplete="off"></label>
+      <label>密码${edit && x.has_password ? '（已保存，留空则不修改）' : '（可选）'}<input name="password" type="password" autocomplete="new-password"></label>
+    </div>
+    <p class="hint">该代理由线路的<strong>最后一个节点</strong>去连接，请确认那台服务器能访问到这个地址。</p>`,
+  async (f) => {
+    await api(edit ? 'PUT' : 'POST', '/api/exits' + (edit ? '/' + x.id : ''), {
+      name: f.name.value, protocol: f.protocol.value, address: f.address.value, port: +f.port.value,
+      username: f.username.value, password: f.password.value,
+    });
+  });
+}
+
 // ---------- 线路 ----------
 function chainDialog(c) {
   const edit = !!c;
@@ -251,9 +358,12 @@ function chainDialog(c) {
       <div id="hops"></div>
       <button type="button" class="small" id="addHop">+ 添加下一跳</button>
     </fieldset>
+    <label>最终出口
+      <select name="exit_id"><option value="">从最后一个节点直接出网</option>
+        ${S.exits.map((x) => `<option value="${x.id}" ${c && c.exit_id === x.id ? 'selected' : ''}>经出口代理「${esc(x.name)}」</option>`).join('')}</select></label>
     <p class="hint">「内网 / 公网」表示上一跳通过哪个地址连接该节点，例如广州 → 香港走专线内网，香港 → 新加坡走公网。请在云厂商安全组中放行对应端口。</p>`,
   async (f) => {
-    await api(edit ? 'PUT' : 'POST', '/api/chains' + (edit ? '/' + c.id : ''), { name: f.name.value, port: +f.port.value, hops });
+    await api(edit ? 'PUT' : 'POST', '/api/chains' + (edit ? '/' + c.id : ''), { name: f.name.value, port: +f.port.value, hops, exit_id: f.exit_id.value });
   });
   const draw = () => {
     $('#hops').innerHTML = hops.map((h, i) => `<div class="hop">
@@ -291,13 +401,18 @@ function userDialog(u) {
   openDialog(edit ? '编辑用户' : '添加用户', `
     <label>用户名<input name="name" value="${esc(u.name)}" maxlength="64" required></label>
     <label>备注<input name="remark" value="${esc(u.remark)}"></label>
+    <label>最终出口
+      <select name="exit_id">
+        <option value="">跟随线路的默认出口</option>
+        <option value="direct" ${u.exit_id === 'direct' ? 'selected' : ''}>从线路最后一个节点直接出网</option>
+        ${S.exits.map((x) => `<option value="${x.id}" ${u.exit_id === x.id ? 'selected' : ''}>经出口代理「${esc(x.name)}」</option>`).join('')}</select></label>
     <label class="check"><input type="checkbox" name="enabled" ${u.enabled ? 'checked' : ''}>启用</label>
     <fieldset><legend>可用线路（一个都不勾选 = 全部线路，包括以后新增的）</legend>
       ${S.chains.map((c) => `<label class="check"><input type="checkbox" name="chain" value="${c.id}" ${u.chain_ids.includes(c.id) ? 'checked' : ''}>${esc(c.name)}</label>`).join('') || '<span class="muted">还没有线路</span>'}
     </fieldset>`, async (f) => {
     const chain_ids = [...f.querySelectorAll('input[name=chain]:checked')].map((x) => x.value);
     await api(edit ? 'PUT' : 'POST', '/api/users' + (edit ? '/' + u.id : ''),
-      { name: f.name.value, remark: f.remark.value, enabled: f.enabled.checked, chain_ids });
+      { name: f.name.value, remark: f.remark.value, enabled: f.enabled.checked, chain_ids, exit_id: f.exit_id.value });
   });
 }
 
@@ -309,7 +424,7 @@ function linksDialog(u) {
     ${u.enabled ? '' : '<p class="err">该用户已停用</p>'}
     ${item('UUID', u.uuid)}
     ${item('订阅地址（导入 v2rayN / v2rayNG 等客户端，包含全部可用线路）', sub)}
-    ${u.links.map((l) => item(l.name, l.link)).join('') || '<p class="muted">暂无可用线路</p>'}
+    ${u.links.map((l) => item(`${l.name}　出口：${l.exit}`, l.link)).join('') || '<p class="muted">暂无可用线路</p>'}
     <p class="hint">协议 VMess / TCP / alterId 0。新建或修改后需「同步全部配置」才会生效。</p>`, null);
 }
 
@@ -351,6 +466,13 @@ document.addEventListener('click', async (e) => {
           await refresh();
         }
         return;
+      case 'node-conf': return confDialog(node);
+      case 'node-backups': return backupsDialog(node);
+      case 'exit-new': return exitDialog();
+      case 'exit-edit': return exitDialog(S.exits.find((x) => x.id === id));
+      case 'exit-del':
+        if (confirm('删除该出口代理？')) { await api('DELETE', `/api/exits/${id}`); await refresh(); }
+        return;
       case 'node-del':
         if (confirm(`删除节点「${node.name}」？（不会卸载服务器上的 v2ray）`)) { await api('DELETE', `/api/nodes/${id}`); await refresh(); }
         return;
@@ -364,7 +486,7 @@ document.addEventListener('click', async (e) => {
       case 'user-edit': return userDialog(user);
       case 'user-links': return linksDialog(user);
       case 'user-toggle':
-        await api('PUT', `/api/users/${id}`, { name: user.name, remark: user.remark, chain_ids: user.chain_ids, enabled: !user.enabled });
+        await api('PUT', `/api/users/${id}`, { name: user.name, remark: user.remark, chain_ids: user.chain_ids, exit_id: user.exit_id, enabled: !user.enabled });
         return refresh();
       case 'user-reset':
         if (confirm(`重置「${user.name}」的 UUID 和订阅地址？同步配置后旧凭据失效。`)) { await api('POST', `/api/users/${id}/reset`); await refresh(); }

@@ -24,6 +24,7 @@
     <nav id="tabs">
       <a data-tab="nodes" class="active">节点</a>
       <a data-tab="chains">线路</a>
+      <a data-tab="exits">出口代理</a>
       <a data-tab="users">用户</a>
       <a data-tab="tasks">任务日志</a>
       <a data-tab="settings">设置</a>
@@ -59,13 +60,25 @@
       </table></div>
     </section>
 
+    <section id="tab-exits" class="hidden">
+      <div class="bar">
+        <h2>出口代理</h2>
+        <button class="primary" data-act="exit-new">添加出口代理</button>
+      </div>
+      <p class="hint">出口代理是线路末端节点之后的最后一站（SOCKS5 / HTTP 代理）。可以设为某条线路的默认出口，也可以单独指定给某个用户。</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>名称</th><th>协议</th><th>地址</th><th>认证</th><th>使用情况</th><th>操作</th></tr></thead>
+        <tbody id="exitRows"></tbody>
+      </table></div>
+    </section>
+
     <section id="tab-users" class="hidden">
       <div class="bar">
         <h2>用户</h2>
         <button class="primary" data-act="user-new">添加用户</button>
       </div>
       <div class="tablewrap"><table>
-        <thead><tr><th>用户名</th><th>状态</th><th>可用线路</th><th>备注</th><th>操作</th></tr></thead>
+        <thead><tr><th>用户名</th><th>状态</th><th>可用线路</th><th>出口</th><th>备注</th><th>操作</th></tr></thead>
         <tbody id="userRows"></tbody>
       </table></div>
     </section>

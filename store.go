@@ -32,7 +32,32 @@ type Node struct {
 	CheckedAt     time.Time `json:"checked_at"`
 	AppliedHash   string    `json:"applied_hash"`
 	AppliedAt     time.Time `json:"applied_at"`
+
+	Conf NodeConf `json:"conf"`
 }
+
+// NodeConf 是单个节点的 v2ray 配置项。
+type NodeConf struct {
+	LogLevel     string   `json:"log_level"`     // debug / info / warning / error / none，默认 warning
+	DNS          []string `json:"dns"`           // 自定义 DNS 服务器，为空使用系统 DNS
+	Sniffing     bool     `json:"sniffing"`      // 入站流量嗅探（http / tls）
+	AllowPrivate bool     `json:"allow_private"` // 作为出口时允许访问私有地址段
+	Extra        string   `json:"extra"`         // 追加 / 覆盖的自定义 JSON
+}
+
+// Exit 是最终出口代理：线路最后一个节点把流量再转交给它（socks / http）。
+type Exit struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"` // socks / http
+	Address  string `json:"address"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password,omitempty"`
+}
+
+// exitDirect 用在 User.ExitID 上，表示强制从线路末端节点直接出网。
+const exitDirect = "direct"
 
 // Hop 是线路中的一跳。Addr 表示「上一跳如何访问本跳」：public 或 internal。
 type Hop struct {
@@ -47,6 +72,7 @@ type Chain struct {
 	Port      int    `json:"port"` // 线路在每个节点上使用的端口
 	Hops      []Hop  `json:"hops"`
 	RelayUUID string `json:"relay_uuid"` // 节点之间互联使用的凭据
+	ExitID    string `json:"exit_id"`    // 默认出口代理，为空表示从末端节点直接出网
 }
 
 // User 是一个代理账号。
@@ -57,6 +83,7 @@ type User struct {
 	SubToken  string    `json:"sub_token"`
 	Enabled   bool      `json:"enabled"`
 	ChainIDs  []string  `json:"chain_ids"` // 为空表示可使用全部线路
+	ExitID    string    `json:"exit_id"`   // 为空跟随线路；direct 表示末端节点直连；否则为指定出口代理
 	Remark    string    `json:"remark"`
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -77,6 +104,7 @@ type DB struct {
 	Settings Settings `json:"settings"`
 	Nodes    []*Node  `json:"nodes"`
 	Chains   []*Chain `json:"chains"`
+	Exits    []*Exit  `json:"exits"`
 	Users    []*User  `json:"users"`
 }
 
@@ -158,6 +186,15 @@ func (db *DB) chain(id string) *Chain {
 	for _, c := range db.Chains {
 		if c.ID == id {
 			return c
+		}
+	}
+	return nil
+}
+
+func (db *DB) exit(id string) *Exit {
+	for _, e := range db.Exits {
+		if e.ID == id {
+			return e
 		}
 	}
 	return nil

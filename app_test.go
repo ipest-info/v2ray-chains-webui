@@ -79,6 +79,95 @@ func TestBuildConfigNoUsers(t *testing.T) {
 	}
 }
 
+// 用户级出口：dave 指定走 socks 出口，alice 跟随线路默认（末端直连）。
+func TestPerUserExit(t *testing.T) {
+	db := testDB()
+	db.Exits = []*Exit{{ID: "e1", Name: "住宅代理", Protocol: "socks", Address: "9.9.9.9", Port: 1080, Username: "u", Password: "p"}}
+	db.Users = append(db.Users, &User{ID: "u4", Name: "dave", UUID: "dave-uuid", Enabled: true, ExitID: "e1"})
+	exitRelay, exitEmail := relayID(db.Chains[0], "e1")
+
+	rulesOf := func(node string) []any {
+		cfg, _ := buildConfig(db, node)
+		return cfg["routing"].(obj)["rules"].([]any)
+	}
+	find := func(rules []any, user string) string {
+		for _, r := range rules {
+			r := r.(obj)
+			us, _ := r["user"].([]string)
+			if (user == "" && us == nil && r["ip"] == nil) || (len(us) == 1 && us[0] == user) {
+				return r["outboundTag"].(string)
+			}
+		}
+		return ""
+	}
+
+	// 入口：dave 走带出口标记的出站，其余用户走默认出站。
+	gz := rulesOf("gz")
+	if find(gz, "dave") != "out-c1-e1" || find(gz, "") != "out-c1" {
+		t.Errorf("入口规则不正确: %v", gz)
+	}
+	gzJSON, _ := configJSON(db, "gz")
+	if !strings.Contains(gzJSON, exitRelay) || !strings.Contains(gzJSON, "relay-uuid") {
+		t.Errorf("入口应同时带有两种互联凭据:\n%s", gzJSON)
+	}
+
+	// 中转：按互联凭据分流。
+	hk := rulesOf("hk")
+	if find(hk, exitEmail) != "out-c1-e1" || find(hk, "") != "out-c1" {
+		t.Errorf("中转规则不正确: %v", hk)
+	}
+
+	// 出口：带标记的走 socks 代理，其余直连。
+	sg := rulesOf("sg")
+	if find(sg, exitEmail) != "exit-e1" || find(sg, "") != "direct" {
+		t.Errorf("出口规则不正确: %v", sg)
+	}
+	sgJSON, _ := configJSON(db, "sg")
+	if !strings.Contains(sgJSON, `"protocol": "socks"`) || !strings.Contains(sgJSON, `"address": "9.9.9.9"`) {
+		t.Errorf("出口节点缺少 socks 出站:\n%s", sgJSON)
+	}
+
+	// 线路默认出口改为代理、alice 强制直连：两者对调。
+	db.Chains[0].ExitID = "e1"
+	db.Users[3].ExitID = ""
+	db.Users[0].ExitID = exitDirect
+	sg = rulesOf("sg")
+	if find(sg, "relay@c1") != "direct" || find(sg, "") != "exit-e1" {
+		t.Errorf("默认出口为代理时规则不正确: %v", sg)
+	}
+}
+
+func TestNodeConf(t *testing.T) {
+	db := testDB()
+	db.node("sg").Conf = NodeConf{
+		LogLevel: "info", DNS: []string{"8.8.8.8"}, Sniffing: true, AllowPrivate: true,
+		Extra: `{"policy":{"levels":{"0":{"connIdle":120}}},
+			"inbounds":[{"tag":"x-in","port":1234,"protocol":"socks"}],
+			"routing":{"rules":[{"type":"field","inboundTag":["x-in"],"outboundTag":"direct"}]}}`,
+	}
+	cfg, _ := buildConfig(db, "sg")
+	s, _ := configJSON(db, "sg")
+	if cfg["log"].(obj)["loglevel"] != "info" || cfg["dns"] == nil || cfg["policy"] == nil {
+		t.Errorf("配置项未生效:\n%s", s)
+	}
+	if strings.Contains(s, "geoip:private") || !strings.Contains(s, "destOverride") {
+		t.Errorf("AllowPrivate / Sniffing 未生效:\n%s", s)
+	}
+	if n := len(cfg["inbounds"].([]any)); n != 2 {
+		t.Errorf("自定义入站应追加在后面，共 %d 个", n)
+	}
+	rules := cfg["routing"].(obj)["rules"].([]any)
+	if tags := rules[0].(obj)["inboundTag"].([]any); tags[0] != "x-in" {
+		t.Errorf("自定义路由规则应排在最前: %v", rules)
+	}
+	if _, err := parseExtra(`{"inbounds":{}}`); err == nil {
+		t.Error("inbounds 不是数组时应报错")
+	}
+	if _, err := parseExtra(`[1]`); err == nil {
+		t.Error("不是对象时应报错")
+	}
+}
+
 func TestVmessLink(t *testing.T) {
 	db := testDB()
 	link := vmessLink(db, db.Users[0], db.Chains[0])

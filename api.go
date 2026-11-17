@@ -107,6 +107,15 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/nodes/{id}/reset-hostkey", a.api(a.nodeResetHostKey))
 	mux.HandleFunc("GET /api/nodes/{id}/config", a.api(a.nodeConfig))
 	mux.HandleFunc("POST /api/apply-all", a.api(a.applyAll))
+	mux.HandleFunc("PUT /api/nodes/{id}/conf", a.api(a.saveNodeConf))
+	mux.HandleFunc("GET /api/nodes/{id}/backups", a.api(a.backupList))
+	mux.HandleFunc("POST /api/nodes/{id}/backups", a.api(a.backupCreate))
+	mux.HandleFunc("GET /api/nodes/{id}/backups/{name}", a.api(a.backupGet))
+	mux.HandleFunc("POST /api/nodes/{id}/backups/{name}/restore", a.api(a.backupRestore))
+
+	mux.HandleFunc("POST /api/exits", a.api(a.saveExit))
+	mux.HandleFunc("PUT /api/exits/{id}", a.api(a.saveExit))
+	mux.HandleFunc("DELETE /api/exits/{id}", a.api(a.deleteExit))
 
 	mux.HandleFunc("POST /api/chains", a.api(a.saveChain))
 	mux.HandleFunc("PUT /api/chains/{id}", a.api(a.saveChain))
@@ -216,6 +225,11 @@ type nodeView struct {
 	Dirty       bool `json:"dirty"`
 }
 
+type exitView struct {
+	Exit
+	HasPassword bool `json:"has_password"`
+}
+
 type userView struct {
 	User
 	Links []obj `json:"links"`
@@ -236,7 +250,11 @@ func (a *App) state(w http.ResponseWriter, r *http.Request) (any, error) {
 		v := userView{User: *u, Links: []obj{}}
 		for _, c := range db.Chains {
 			if userAllowed(u, c.ID) {
-				v.Links = append(v.Links, obj{"chain_id": c.ID, "name": chainPath(db, c), "link": vmessLink(db, u, c)})
+				exit := "末端节点直连"
+				if e := db.exit(userExit(db, u, c)); e != nil {
+					exit = e.Name
+				}
+				v.Links = append(v.Links, obj{"chain_id": c.ID, "name": chainPath(db, c), "exit": exit, "link": vmessLink(db, u, c)})
 			}
 		}
 		users = append(users, v)
@@ -244,11 +262,18 @@ func (a *App) state(w http.ResponseWriter, r *http.Request) (any, error) {
 	if db.Chains == nil {
 		db.Chains = []*Chain{}
 	}
+	exits := make([]exitView, 0, len(db.Exits))
+	for _, e := range db.Exits {
+		v := exitView{Exit: *e, HasPassword: e.Password != ""}
+		v.Password = ""
+		exits = append(exits, v)
+	}
 	return obj{
 		"admin":    db.Admin.Username,
 		"settings": db.Settings,
 		"nodes":    nodes,
 		"chains":   db.Chains,
+		"exits":    exits,
 		"users":    users,
 		"tasks":    a.tasks.List(),
 	}, nil
@@ -473,14 +498,169 @@ func (a *App) nodeConfig(w http.ResponseWriter, r *http.Request) (any, error) {
 	return obj{"config": cfg}, nil
 }
 
+// ---------- 节点 v2ray 配置项与备份 ----------
+
+var logLevels = map[string]bool{"debug": true, "info": true, "warning": true, "error": true, "none": true}
+
+func (a *App) saveNodeConf(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	var in NodeConf
+	if err := readJSON(r, &in); err != nil {
+		return nil, err
+	}
+	if in.LogLevel == "" {
+		in.LogLevel = "warning"
+	}
+	if !logLevels[in.LogLevel] {
+		return nil, bad("日志级别不正确")
+	}
+	dns := []string{}
+	for _, d := range in.DNS {
+		if d = strings.TrimSpace(d); d == "" {
+			continue
+		}
+		if len(d) > 200 || strings.ContainsAny(d, " \t\r\n\"") {
+			return nil, bad("DNS 服务器格式不正确: %s", d)
+		}
+		dns = append(dns, d)
+	}
+	in.DNS = dns
+	in.Extra = strings.TrimSpace(in.Extra)
+	if _, err := parseExtra(in.Extra); err != nil {
+		return nil, bad("自定义 JSON %v", err)
+	}
+	return nil, a.store.Update(func(db *DB) error {
+		n := db.node(id)
+		if n == nil {
+			return errNotFound
+		}
+		n.Conf = in
+		return nil
+	})
+}
+
+func (a *App) backupList(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	if _, err := a.nodeName(id); err != nil {
+		return nil, err
+	}
+	list, err := a.listBackups(id)
+	if err != nil {
+		return nil, bad("%v", err)
+	}
+	return obj{"backups": list}, nil
+}
+
+func (a *App) backupGet(w http.ResponseWriter, r *http.Request) (any, error) {
+	id, name := r.PathValue("id"), r.PathValue("name")
+	if _, err := a.nodeName(id); err != nil {
+		return nil, err
+	}
+	if !backupNameRe.MatchString(name) {
+		return nil, bad("备份文件名不正确")
+	}
+	content, err := a.readBackup(id, name)
+	if err != nil {
+		return nil, bad("%v", err)
+	}
+	return obj{"config": content}, nil
+}
+
+func (a *App) backupCreate(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	name, err := a.nodeName(id)
+	if err != nil {
+		return nil, err
+	}
+	t := a.tasks.Start("备份配置：「"+name+"」", func(t *Task) error { return a.backupNode(t, id) })
+	return obj{"task_id": t.ID}, nil
+}
+
+func (a *App) backupRestore(w http.ResponseWriter, r *http.Request) (any, error) {
+	id, file := r.PathValue("id"), r.PathValue("name")
+	name, err := a.nodeName(id)
+	if err != nil {
+		return nil, err
+	}
+	if !backupNameRe.MatchString(file) {
+		return nil, bad("备份文件名不正确")
+	}
+	t := a.tasks.Start("恢复备份：「"+name+"」", func(t *Task) error { return a.restoreNode(t, id, file) })
+	return obj{"task_id": t.ID}, nil
+}
+
+// ---------- 出口代理 ----------
+
+func (a *App) saveExit(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	var in Exit
+	if err := readJSON(r, &in); err != nil {
+		return nil, err
+	}
+	in.Name, in.Address, in.Username = strings.TrimSpace(in.Name), strings.TrimSpace(in.Address), strings.TrimSpace(in.Username)
+	switch {
+	case in.Name == "":
+		return nil, bad("请填写出口名称")
+	case in.Protocol != "socks" && in.Protocol != "http":
+		return nil, bad("协议只支持 socks 或 http")
+	case !addrRe.MatchString(in.Address):
+		return nil, bad("代理地址格式不正确")
+	case in.Port < 1 || in.Port > 65535:
+		return nil, bad("端口范围 1-65535")
+	}
+	return nil, a.store.Update(func(db *DB) error {
+		var e *Exit
+		if id == "" {
+			e = &Exit{ID: randHex(4)}
+			db.Exits = append(db.Exits, e)
+		} else if e = db.exit(id); e == nil {
+			return errNotFound
+		}
+		e.Name, e.Protocol, e.Address, e.Port = in.Name, in.Protocol, in.Address, in.Port
+		// 密码留空表示保持不变；用户名清空则一并清除密码。
+		if in.Password != "" {
+			e.Password = in.Password
+		}
+		if in.Username == "" {
+			e.Password = ""
+		}
+		e.Username = in.Username
+		return nil
+	})
+}
+
+func (a *App) deleteExit(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	return nil, a.store.Update(func(db *DB) error {
+		for _, c := range db.Chains {
+			if c.ExitID == id {
+				return bad("线路「%s」正在使用该出口，请先修改", c.Name)
+			}
+		}
+		for _, u := range db.Users {
+			if u.ExitID == id {
+				return bad("用户「%s」正在使用该出口，请先修改", u.Name)
+			}
+		}
+		for i, e := range db.Exits {
+			if e.ID == id {
+				db.Exits = append(db.Exits[:i], db.Exits[i+1:]...)
+				return nil
+			}
+		}
+		return errNotFound
+	})
+}
+
 // ---------- 线路 ----------
 
 func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 	id := r.PathValue("id")
 	var in struct {
-		Name string `json:"name"`
-		Port int    `json:"port"`
-		Hops []Hop  `json:"hops"`
+		Name   string `json:"name"`
+		Port   int    `json:"port"`
+		Hops   []Hop  `json:"hops"`
+		ExitID string `json:"exit_id"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
@@ -497,6 +677,9 @@ func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 		return nil, bad("线路最多 8 跳")
 	}
 	return nil, a.store.Update(func(db *DB) error {
+		if in.ExitID != "" && db.exit(in.ExitID) == nil {
+			return bad("所选出口代理不存在")
+		}
 		seen := map[string]bool{}
 		for i := range in.Hops {
 			h := &in.Hops[i]
@@ -538,7 +721,7 @@ func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 		} else if c = db.chain(id); c == nil {
 			return errNotFound
 		}
-		c.Name, c.Port, c.Hops = in.Name, in.Port, in.Hops
+		c.Name, c.Port, c.Hops, c.ExitID = in.Name, in.Port, in.Hops, in.ExitID
 		return nil
 	})
 }
@@ -593,6 +776,7 @@ func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 		Enabled  bool     `json:"enabled"`
 		ChainIDs []string `json:"chain_ids"`
 		Remark   string   `json:"remark"`
+		ExitID   string   `json:"exit_id"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
@@ -606,6 +790,9 @@ func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 			if u.Name == in.Name && u.ID != id {
 				return bad("用户名已存在")
 			}
+		}
+		if in.ExitID != "" && in.ExitID != exitDirect && db.exit(in.ExitID) == nil {
+			return bad("所选出口代理不存在")
 		}
 		for _, cid := range in.ChainIDs {
 			if db.chain(cid) == nil {
@@ -623,6 +810,7 @@ func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 			in.ChainIDs = []string{}
 		}
 		u.Name, u.Enabled, u.ChainIDs, u.Remark = in.Name, in.Enabled, in.ChainIDs, strings.TrimSpace(in.Remark)
+		u.ExitID = in.ExitID
 		return nil
 	})
 }
