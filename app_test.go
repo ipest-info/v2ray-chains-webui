@@ -366,3 +366,46 @@ func TestParseExitLine(t *testing.T) {
 		}
 	}
 }
+
+// 出口代理不转发 UDP 时，末端节点上应有单独的 UDP 规则，且排在该出口的普通规则之前。
+func TestExitUDPHandling(t *testing.T) {
+	db := testDB()
+	db.Exits = []*Exit{{ID: "e1", Name: "x", Protocol: "socks", Address: "9.9.9.9", Port: 1080}}
+	db.Chains[0].ExitID = "e1"
+	udpRule := func() obj {
+		cfg, _ := buildConfig(db, "sg")
+		rules := cfg["routing"].(obj)["rules"].([]any)
+		for i, r := range rules {
+			if r.(obj)["network"] == "udp" {
+				if next := rules[i+1].(obj); next["outboundTag"] != "exit-e1" {
+					t.Errorf("UDP 规则应紧挨在出口规则之前: %v", rules)
+				}
+				return r.(obj)
+			}
+		}
+		return nil
+	}
+	if r := udpRule(); r != nil {
+		t.Errorf("SOCKS5 未检测时应经代理转发 UDP，不应有单独规则: %v", r)
+	}
+	db.Exits[0].UDPStatus = "fail"
+	if r := udpRule(); r == nil || r["outboundTag"] != "block" {
+		t.Errorf("检测为不支持后应丢弃 UDP: %v", r)
+	}
+	db.Chains[0].UDPFallback = "direct"
+	if r := udpRule(); r == nil || r["outboundTag"] != "direct" {
+		t.Errorf("线路设为直连时 UDP 应从末端节点出网: %v", r)
+	}
+	db.Exits[0].UDP = "proxy"
+	if r := udpRule(); r != nil {
+		t.Errorf("强制经代理时不应有单独规则: %v", r)
+	}
+	db.Exits[0].UDP, db.Exits[0].UDPStatus = "off", "ok"
+	if r := udpRule(); r == nil {
+		t.Error("关闭后应有单独规则")
+	}
+	db.Exits[0].UDP, db.Exits[0].Protocol = "auto", "http"
+	if r := udpRule(); r == nil {
+		t.Error("HTTP 代理始终不转发 UDP")
+	}
+}

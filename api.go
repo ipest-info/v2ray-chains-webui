@@ -123,6 +123,8 @@ func (a *App) routes() http.Handler {
 
 	mux.HandleFunc("POST /api/exits", a.api(a.saveExit))
 	mux.HandleFunc("POST /api/exits/import", a.api(a.importExits))
+	mux.HandleFunc("POST /api/exits/udp-test", a.api(a.exitUDPTest))
+	mux.HandleFunc("POST /api/exits/{id}/udp-test", a.api(a.exitUDPTest))
 	mux.HandleFunc("PUT /api/exits/{id}", a.api(a.saveExit))
 	mux.HandleFunc("DELETE /api/exits/{id}", a.api(a.deleteExit))
 
@@ -239,6 +241,7 @@ type nodeView struct {
 type exitView struct {
 	Exit
 	HasPassword bool `json:"has_password"`
+	UDPViaProxy bool `json:"udp_via_proxy"`
 }
 
 type userView struct {
@@ -275,7 +278,7 @@ func (a *App) state(w http.ResponseWriter, r *http.Request) (any, error) {
 	}
 	exits := make([]exitView, 0, len(db.Exits))
 	for _, e := range db.Exits {
-		v := exitView{Exit: *e, HasPassword: e.Password != ""}
+		v := exitView{Exit: *e, HasPassword: e.Password != "", UDPViaProxy: e.udpViaProxy()}
 		v.Password = ""
 		exits = append(exits, v)
 	}
@@ -619,6 +622,13 @@ func (a *App) saveExit(w http.ResponseWriter, r *http.Request) (any, error) {
 		return nil, bad("代理地址格式不正确")
 	case in.Port < 1 || in.Port > 65535:
 		return nil, bad("端口范围 1-65535")
+	case in.UDP != "" && in.UDP != "auto" && in.UDP != "proxy" && in.UDP != "off":
+		return nil, bad("UDP 处理方式不正确")
+	case in.UDP == "proxy" && in.Protocol != "socks":
+		return nil, bad("HTTP 代理无法转发 UDP")
+	}
+	if in.UDP == "" {
+		in.UDP = "auto"
 	}
 	return nil, a.store.Update(func(db *DB) error {
 		var e *Exit
@@ -628,7 +638,11 @@ func (a *App) saveExit(w http.ResponseWriter, r *http.Request) (any, error) {
 		} else if e = db.exit(id); e == nil {
 			return errNotFound
 		}
-		e.Name, e.Protocol, e.Address, e.Port = in.Name, in.Protocol, in.Address, in.Port
+		// 换了代理服务器后，之前的 UDP 检测结果不再适用。
+		if e.Protocol != in.Protocol || e.Address != in.Address || e.Port != in.Port || e.Username != in.Username {
+			e.UDPStatus, e.UDPMsg, e.UDPCheckedAt = "", "", time.Time{}
+		}
+		e.Name, e.Protocol, e.Address, e.Port, e.UDP = in.Name, in.Protocol, in.Address, in.Port, in.UDP
 		// 密码留空表示保持不变；用户名清空则一并清除密码。
 		if in.Password != "" {
 			e.Password = in.Password
@@ -669,10 +683,11 @@ func (a *App) deleteExit(w http.ResponseWriter, r *http.Request) (any, error) {
 func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 	id := r.PathValue("id")
 	var in struct {
-		Name   string `json:"name"`
-		Port   int    `json:"port"`
-		Hops   []Hop  `json:"hops"`
-		ExitID string `json:"exit_id"`
+		Name        string `json:"name"`
+		Port        int    `json:"port"`
+		Hops        []Hop  `json:"hops"`
+		ExitID      string `json:"exit_id"`
+		UDPFallback string `json:"udp_fallback"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
@@ -734,6 +749,10 @@ func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 			return errNotFound
 		}
 		c.Name, c.Port, c.Hops, c.ExitID = in.Name, in.Port, in.Hops, in.ExitID
+		c.UDPFallback = "block"
+		if in.UDPFallback == "direct" {
+			c.UDPFallback = "direct"
+		}
 		return nil
 	})
 }

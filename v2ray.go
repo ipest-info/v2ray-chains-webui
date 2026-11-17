@@ -177,11 +177,18 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 		// 默认出口（variants[0]）作为兜底规则放在最后，其余出口按用户 / 凭据匹配。
 		for i := len(variants) - 1; i >= 0; i-- {
 			v := variants[i]
-			var outTag string
+			var outTag, udpTag string
 			if last {
 				outTag = "direct"
 				if e := db.exit(v); e != nil {
 					outTag = "exit-" + e.ID
+					// 代理不转发 UDP 时，UDP 单独处理：丢弃，或改从本节点直接出网。
+					if !e.udpViaProxy() {
+						udpTag = "block"
+						if c.UDPFallback == "direct" {
+							udpTag = "direct"
+						}
+					}
 					if !addedExit[e.ID] {
 						addedExit[e.ID] = true
 						outbounds = append(outbounds, exitOutbound(e))
@@ -216,6 +223,13 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 					emails = append(emails, email)
 				}
 				rule["user"] = emails
+			}
+			if udpTag != "" {
+				udpRule := obj{"type": "field", "inboundTag": []string{inTag}, "network": "udp", "outboundTag": udpTag}
+				if us, ok := rule["user"]; ok {
+					udpRule["user"] = us
+				}
+				rules = append(rules, udpRule)
 			}
 			rules = append(rules, rule)
 		}

@@ -111,12 +111,14 @@ function render() {
       <td>${x.protocol === 'socks' ? 'SOCKS5' : 'HTTP'}</td>
       <td class="mono">${esc(x.address)}:${x.port}</td>
       <td>${x.username ? esc(x.username) : '<span class="muted">无</span>'}</td>
+      <td>${udpCell(x)}</td>
       <td>${chains.length ? `线路：${esc(chains.join('、'))}` : ''}${chains.length && users.length ? '<br>' : ''}${users.length ? `用户：${esc(users.join('、'))}` : ''}${!chains.length && !users.length ? '<span class="muted">未使用</span>' : ''}</td>
       <td class="ops">
+        ${x.protocol === 'socks' ? `<button class="small" data-act="exit-udp" data-id="${x.id}">检测 UDP</button>` : ''}
         <button class="small" data-act="exit-edit" data-id="${x.id}">编辑</button>
         <button class="small danger" data-act="exit-del" data-id="${x.id}">删除</button>
       </td></tr>`;
-  }).join('') || '<tr><td colspan="6" class="empty">还没有出口代理（不配置时，流量从线路末端节点直接出网）</td></tr>';
+  }).join('') || '<tr><td colspan="7" class="empty">还没有出口代理（不配置时，流量从线路末端节点直接出网）</td></tr>';
 
   $('#userRows').innerHTML = S.users.map((u) => `<tr>
       <td><strong>${esc(u.name)}</strong></td>
@@ -163,6 +165,17 @@ function render() {
   if (document.activeElement !== sf.download_url) sf.download_url.value = S.settings.download_url || '';
   const pf = $('#passwordForm');
   if (!pf.username.value) pf.username.value = S.admin;
+}
+
+// 出口代理的 UDP 列：当前实际处理方式 + 最近一次检测结果。
+function udpCell(x) {
+  if (x.protocol !== 'socks') return '<span class="badge">不经代理</span><div class="muted">HTTP 代理不支持 UDP</div>';
+  const mode = x.udp === 'proxy' ? '强制' : x.udp === 'off' ? '已关闭' : '自动';
+  const eff = x.udp_via_proxy ? '<span class="badge ok">经代理转发</span>' : '<span class="badge warn">不经代理</span>';
+  const st = x.udp_status === 'ok' ? '检测：支持'
+    : x.udp_status === 'fail' ? '<span style="color:var(--bad)">检测：不支持</span>'
+      : x.udp_status === 'error' ? '检测：无法判断' : '未检测';
+  return `${eff} <span class="muted">${mode}</span><div class="muted" title="${esc(x.udp_msg)}">${st}</div>`;
 }
 
 const taskBadge = (s) => s === 'running' ? '<span class="badge warn">执行中</span>'
@@ -430,11 +443,18 @@ function exitDialog(x) {
       <label>用户名（可选）<input name="username" value="${esc(x.username)}" autocomplete="off"></label>
       <label>密码${edit && x.has_password ? '（已保存，留空则不修改）' : '（可选）'}<input name="password" type="password" autocomplete="new-password"></label>
     </div>
+    <label>UDP 处理方式
+      <select name="udp">
+        <option value="auto">自动：SOCKS5 经代理转发；检测出不支持后改为不经代理</option>
+        <option value="proxy" ${x.udp === 'proxy' ? 'selected' : ''}>强制经代理转发（忽略检测结果）</option>
+        <option value="off" ${x.udp === 'off' ? 'selected' : ''}>不经代理（按线路设置丢弃或直连）</option>
+      </select></label>
     <p class="hint">该代理由线路的<strong>最后一个节点</strong>去连接，请确认那台服务器能访问到这个地址。</p>`,
   async (f) => {
     await api(edit ? 'PUT' : 'POST', '/api/exits' + (edit ? '/' + x.id : ''), {
       name: f.name.value, protocol: f.protocol.value, address: f.address.value, port: +f.port.value,
       username: f.username.value, password: f.password.value,
+      udp: f.protocol.value === 'socks' ? f.udp.value : 'auto',
     });
   });
 }
@@ -456,9 +476,14 @@ function chainDialog(c) {
     <label>最终出口
       <select name="exit_id"><option value="">从最后一个节点直接出网</option>
         ${S.exits.map((x) => `<option value="${x.id}" ${c && c.exit_id === x.id ? 'selected' : ''}>经出口代理「${esc(x.name)}」</option>`).join('')}</select></label>
+    <label>出口代理不转发 UDP 时（代理不支持 UDP，或是 HTTP 代理）
+      <select name="udp_fallback">
+        <option value="block">丢弃 UDP（不暴露末端节点 IP；应用一般会改用 TCP）</option>
+        <option value="direct" ${c && c.udp_fallback === 'direct' ? 'selected' : ''}>UDP 改从最后一个节点直接出网（UDP 应用可用，但出口 IP 是节点 IP 而非代理 IP）</option>
+      </select></label>
     <p class="hint">「内网 / 公网」表示上一跳通过哪个地址连接该节点，例如广州 → 香港走专线内网，香港 → 新加坡走公网。请在云厂商安全组中放行对应端口。</p>`,
   async (f) => {
-    await api(edit ? 'PUT' : 'POST', '/api/chains' + (edit ? '/' + c.id : ''), { name: f.name.value, port: +f.port.value, hops, exit_id: f.exit_id.value });
+    await api(edit ? 'PUT' : 'POST', '/api/chains' + (edit ? '/' + c.id : ''), { name: f.name.value, port: +f.port.value, hops, exit_id: f.exit_id.value, udp_fallback: f.udp_fallback.value });
   });
   const draw = () => {
     $('#hops').innerHTML = hops.map((h, i) => `<div class="hop">
@@ -565,6 +590,8 @@ document.addEventListener('click', async (e) => {
       case 'node-backups': return backupsDialog(node);
       case 'exit-new': return exitDialog();
       case 'exit-import': return exitImportDialog();
+      case 'exit-udp': return startTask(`/api/exits/${id}/udp-test`);
+      case 'exit-udp-all': return startTask('/api/exits/udp-test');
       case 'exit-edit': return exitDialog(S.exits.find((x) => x.id === id));
       case 'exit-del':
         if (confirm('删除该出口代理？')) { await api('DELETE', `/api/exits/${id}`); await refresh(); }

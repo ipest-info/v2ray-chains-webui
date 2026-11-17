@@ -54,6 +54,26 @@ type Exit struct {
 	Port     int    `json:"port"`
 	Username string `json:"username"`
 	Password string `json:"password,omitempty"`
+
+	// UDP 处理方式：auto（默认，SOCKS5 且未检测出不支持时经代理转发）/ proxy（强制经代理）/ off（不经代理）。
+	UDP          string    `json:"udp"`
+	UDPStatus    string    `json:"udp_status"` // 最近一次检测结果：ok / fail / error / 空（未检测）
+	UDPMsg       string    `json:"udp_msg"`
+	UDPCheckedAt time.Time `json:"udp_checked_at"`
+}
+
+// udpViaProxy 返回该出口的 UDP 流量是否交给代理转发。HTTP 代理无法承载 UDP。
+func (e *Exit) udpViaProxy() bool {
+	if e.Protocol != "socks" {
+		return false
+	}
+	switch e.UDP {
+	case "proxy":
+		return true
+	case "off":
+		return false
+	}
+	return e.UDPStatus != "fail"
 }
 
 // exitDirect 用在 User.ExitID 上，表示强制从线路末端节点直接出网。
@@ -73,6 +93,8 @@ type Chain struct {
 	Hops      []Hop  `json:"hops"`
 	RelayUUID string `json:"relay_uuid"` // 节点之间互联使用的凭据
 	ExitID    string `json:"exit_id"`    // 默认出口代理，为空表示从末端节点直接出网
+	// 出口代理不转发 UDP 时，本线路上 UDP 的处理：block（默认，丢弃）/ direct（从末端节点直接出网）。
+	UDPFallback string `json:"udp_fallback"`
 }
 
 // User 是一个代理账号。
