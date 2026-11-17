@@ -441,9 +441,9 @@ func TestBandwidthSampling(t *testing.T) {
 	if _, ok := m.tiers[0][1].R["eth0"]; ok {
 		t.Error("计数器变小时不应计算速率")
 	}
-	// 跨过一分钟后，1 分钟档应得到上一分钟的平均值
+	// 跨过一分钟后，1 分钟档应得到上一分钟的平均值：两次采样，eth0 一次 1 Mbit/s、一次无数据
 	m.add(t0.Add(65*time.Second), 165, map[string][2]uint64{"eth0": {20, 20}, "lo": {3000, 3000}})
-	if len(m.tiers[1]) != 1 || m.tiers[1][0].R["eth0"].Rx != 1e6 {
+	if len(m.tiers[1]) != 1 || m.tiers[1][0].R["eth0"].Rx != 5e5 {
 		t.Errorf("1 分钟聚合 = %+v", m.tiers[1])
 	}
 }
