@@ -185,5 +185,9 @@ echo ">> 限速规则已生效：$(echo $RULES | wc -w) 个端口，网卡: $(if
 // nodeHash 是节点「已同步状态」的指纹：v2ray 配置 + 限速规则。
 func nodeHash(db *DB, nodeID string) string {
 	cfg, _ := configJSON(db, nodeID)
-	return configHash(cfg + "\n" + limitsScript(nodeLimits(db, nodeID)))
+	legacy := false
+	if n := db.node(nodeID); n != nil {
+		legacy = n.Conf.LegacyVMess
+	}
+	return configHash(fmt.Sprintf("%s\n%s\nlegacy=%v", cfg, limitsScript(nodeLimits(db, nodeID)), legacy))
 }

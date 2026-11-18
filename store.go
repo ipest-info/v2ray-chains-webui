@@ -34,6 +34,12 @@ type Node struct {
 	AppliedAt     time.Time `json:"applied_at"`
 
 	Conf NodeConf `json:"conf"`
+
+	// 节点作为 WebSocket + TLS 线路入口时使用的域名和证书。
+	TLSDomain string `json:"tls_domain"`
+	TLSCert   string `json:"tls_cert,omitempty"`
+	TLSKey    string `json:"tls_key,omitempty"`
+	TLSAuto   bool   `json:"tls_auto"` // 证书由 acme.sh 申请（自动续期），否则为手动粘贴
 }
 
 // NodeConf 是单个节点的 v2ray 配置项。
@@ -43,6 +49,7 @@ type NodeConf struct {
 	Sniffing     bool     `json:"sniffing"`      // 入站流量嗅探（http / tls）
 	AllowPrivate bool     `json:"allow_private"` // 作为出口时允许访问私有地址段
 	NoAccessLog  bool     `json:"no_access_log"` // 不写访问日志（默认每个连接记一条）
+	LegacyVMess  bool     `json:"legacy_vmess"`  // 接受旧版（非 AEAD，alterId 不为 0）VMess 客户端，不安全
 	Extra        string   `json:"extra"`         // 追加 / 覆盖的自定义 JSON
 }
 
@@ -92,8 +99,13 @@ type Chain struct {
 	Name      string `json:"name"`
 	Port      int    `json:"port"` // 线路在每个节点上使用的端口
 	Hops      []Hop  `json:"hops"`
-	RelayUUID string `json:"relay_uuid"` // 节点之间互联使用的凭据
-	ExitID    string `json:"exit_id"`    // 默认出口代理，为空表示从末端节点直接出网
+	RelayUUID string `json:"relay_uuid,omitempty"` // 节点之间互联使用的凭据
+
+	Transport string `json:"transport"`            // tcp（默认）/ ws / wstls
+	WSPath    string `json:"ws_path"`              // WebSocket 路径
+	RelayCert string `json:"relay_cert,omitempty"` // wstls 时节点互联用的自签证书
+	RelayKey  string `json:"relay_key,omitempty"`
+	ExitID    string `json:"exit_id"` // 默认出口代理，为空表示从末端节点直接出网
 	// 出口代理不转发 UDP 时，本线路上 UDP 的处理：block（默认，丢弃）/ direct（从末端节点直接出网）。
 	UDPFallback string `json:"udp_fallback"`
 }
@@ -175,15 +187,30 @@ func (s *Store) saveLocked() error {
 	return os.Rename(tmp, s.path)
 }
 
-// Update 在持锁状态下修改数据并落盘；fn 返回错误时不保存。
+// Update 修改数据并落盘。fn 在数据的副本上操作：返回错误时副本被丢弃，
+// 已做的部分修改不会留在内存里；成功且写盘成功后才替换当前数据。
 func (s *Store) Update(fn func(db *DB) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := fn(&s.db); err != nil {
+	b, err := json.Marshal(&s.db)
+	if err != nil {
 		return err
 	}
-	ensureLimitPorts(&s.db)
-	return s.saveLocked()
+	var next DB
+	if err := json.Unmarshal(b, &next); err != nil {
+		return err
+	}
+	if err := fn(&next); err != nil {
+		return err
+	}
+	ensureLimitPorts(&next)
+	prev := s.db
+	s.db = next
+	if err := s.saveLocked(); err != nil {
+		s.db = prev
+		return err
+	}
+	return nil
 }
 
 // View 在持锁状态下只读访问数据。

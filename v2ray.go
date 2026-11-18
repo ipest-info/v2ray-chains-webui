@@ -170,7 +170,7 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 				"port":           port,
 				"protocol":       "vmess",
 				"settings":       obj{"clients": clients},
-				"streamSettings": obj{"network": "tcp"},
+				"streamSettings": inboundStream(c, node, idx == 0),
 			}
 			if conf.Sniffing {
 				in["sniffing"] = obj{"enabled": true, "destOverride": []string{"http", "tls"}}
@@ -229,7 +229,7 @@ func buildConfig(db *DB, nodeID string) (obj, []int) {
 						"port":    c.Port,
 						"users":   []any{obj{"id": id, "alterId": 0, "security": "auto"}},
 					}}},
-					"streamSettings": obj{"network": "tcp"},
+					"streamSettings": outboundStream(c),
 				})
 			}
 			rule := obj{"type": "field", "inboundTag": inTags, "outboundTag": outTag}
@@ -381,10 +381,19 @@ func vmessLink(db *DB, u *User, c *Chain) string {
 	if entry == nil {
 		return ""
 	}
-	b, _ := json.Marshal(obj{
+	link := obj{
 		"v": "2", "ps": c.Name, "add": hopAddr(entry, "public"), "port": strconv.Itoa(userPort(u, c)),
 		"id": u.UUID, "aid": "0", "scy": "auto", "net": "tcp", "type": "none", "host": "", "path": "", "tls": "",
-	})
+	}
+	switch c.transport() {
+	case "ws":
+		link["net"], link["path"] = "ws", c.WSPath
+	case "wstls":
+		// 客户端必须用域名连接，证书才能通过校验。
+		link["net"], link["path"], link["tls"] = "ws", c.WSPath, "tls"
+		link["add"], link["host"], link["sni"] = entry.TLSDomain, entry.TLSDomain, entry.TLSDomain
+	}
+	b, _ := json.Marshal(link)
 	return "vmess://" + base64.StdEncoding.EncodeToString(b)
 }
 

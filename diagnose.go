@@ -61,6 +61,8 @@ var logPatterns = []struct {
 }{
 	{regexp.MustCompile(`(?i)address already in use`), "端口被占用",
 		"线路端口已被其它程序占用，v2ray 无法监听。换一个线路端口，或在节点上停掉占用该端口的程序。"},
+	{regexp.MustCompile(`(?i)VMessAEAD is enforced`), "客户端使用了旧版 VMess（alterId 不为 0）",
+		"用户的 UUID 是对的，但客户端用的是已淘汰的旧版 VMess 头，被 v2ray 拒绝。正确的做法是让该用户在客户端里把 alterId（额外 ID）改为 0，或直接重新导入后台的链接 / 更新订阅（后台给出的链接已是 alterId 0）。确实无法更换客户端时，可在节点「配置项」里临时开启「兼容旧版 VMess 客户端」。"},
 	{regexp.MustCompile(`(?i)invalid user|not found user|failed to (validate|read) request|invalid auth`), "VMess 认证失败",
 		"连进来的凭据本节点不认识。常见原因：上下游节点或客户端的配置不是同一版（对所有节点「同步全部配置」，客户端更新订阅）；用户已停用或重置过凭据；节点之间时间相差超过 90 秒；也可能只是公网上的端口扫描。"},
 	{regexp.MustCompile(`(?i)failed to (parse|load|build)|invalid config|unknown (protocol|config)|unmarshal|malformed`), "配置解析失败",

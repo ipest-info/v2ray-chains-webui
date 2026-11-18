@@ -65,7 +65,8 @@ func main() {
 	app.monitor = &Monitor{app: app, nodes: map[string]*nodeMon{}}
 	go app.monitor.run()
 	handler := app.routes()
-	srv := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10}
 	if *tlsCert != "" {
 		log.Printf("管理后台已启动: https://%s", *listen)
 		log.Fatal(srv.ListenAndServeTLS(*tlsCert, *tlsKey))
@@ -91,6 +92,7 @@ func main() {
 		}
 		httpsSrv := &http.Server{
 			Handler: handler, ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10,
 			ErrorLog: log.New(io.Discard, "", 0), // 没有证书时的握手失败不刷日志
 		}
 		go func() { log.Fatal(httpsSrv.Serve(ln)) }()

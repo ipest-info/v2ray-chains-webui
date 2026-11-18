@@ -34,6 +34,13 @@ type TLSSettings struct {
 
 const defaultAcmeBaseURL = "https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.1"
 
+// reservedEnv 是不允许通过「DNS API 凭据」设置的环境变量。
+var reservedEnv = map[string]bool{
+	"PATH": true, "HOME": true, "SHELL": true, "IFS": true, "ENV": true, "PS4": true, "CDPATH": true,
+	"PROMPT_COMMAND": true, "HTTP_PROXY": true, "HTTPS_PROXY": true, "ALL_PROXY": true, "NO_PROXY": true,
+	"CURL_CA_BUNDLE": true, "SSL_CERT_FILE": true, "SSL_CERT_DIR": true,
+}
+
 var (
 	domainRe      = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
 	dnsProviderRe = regexp.MustCompile(`^dns_[a-z0-9_]+$`)
@@ -183,16 +190,8 @@ func (a *App) runAcme(t *Task, script string, env map[string]string, args ...str
 	return 0, nil
 }
 
-// issueCert 用 acme.sh 申请（或续期）后台域名的证书，并让 HTTPS 监听立即使用新证书。
-func (a *App) issueCert(t *Task, force bool) error {
-	a.acmeMu.Lock()
-	defer a.acmeMu.Unlock()
-
-	var cfg TLSSettings
-	a.store.View(func(db *DB) { cfg = db.Settings.TLS })
-	if cfg.Domain == "" {
-		return errors.New("请先在「设置」中填写并保存域名")
-	}
+// acmeObtain 用 acme.sh 为 domain 申请（或续期）证书并写到指定文件。调用方需持有 acmeMu。
+func (a *App) acmeObtain(t *Task, cfg TLSSettings, domain string, force bool, certFile, keyFile string) error {
 	script, err := a.ensureAcme(t, cfg)
 	if err != nil {
 		return err
@@ -201,7 +200,7 @@ func (a *App) issueCert(t *Task, force bool) error {
 	if ca == "" {
 		ca = "letsencrypt"
 	}
-	args := []string{"--issue", "-d", cfg.Domain, "--server", ca, "--keylength", "ec-256"}
+	args := []string{"--issue", "-d", domain, "--server", ca, "--keylength", "ec-256"}
 	if cfg.Email != "" {
 		args = append(args, "--accountemail", cfg.Email)
 	}
@@ -211,7 +210,7 @@ func (a *App) issueCert(t *Task, force bool) error {
 
 	var env map[string]string
 	if cfg.Mode == "dns" {
-		t.logf("使用 DNS 验证（%s）为 %s 申请证书", cfg.DNSProvider, cfg.Domain)
+		t.logf("使用 DNS 验证（%s）为 %s 申请证书", cfg.DNSProvider, domain)
 		args = append(args, "--dns", cfg.DNSProvider)
 		env = cfg.DNSEnv
 	} else {
@@ -229,7 +228,7 @@ func (a *App) issueCert(t *Task, force bool) error {
 		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 		go srv.Serve(ln)
 		defer srv.Close()
-		t.logf("使用 HTTP 验证（80 端口）为 %s 申请证书", cfg.Domain)
+		t.logf("使用 HTTP 验证（80 端口）为 %s 申请证书", domain)
 		args = append(args, "-w", webroot)
 	}
 
@@ -237,12 +236,28 @@ func (a *App) issueCert(t *Task, force bool) error {
 	if code, err := a.runAcme(t, script, env, args...); err != nil && code != 2 {
 		return fmt.Errorf("acme.sh 申请证书失败: %w", err)
 	}
+	if _, err := a.runAcme(t, script, nil, "--install-cert", "-d", domain, "--ecc",
+		"--fullchain-file", certFile, "--key-file", keyFile); err != nil {
+		return fmt.Errorf("安装证书失败: %w", err)
+	}
+	return os.Chmod(keyFile, 0o600)
+}
+
+// issueCert 用 acme.sh 申请（或续期）后台域名的证书，并让 HTTPS 监听立即使用新证书。
+func (a *App) issueCert(t *Task, force bool) error {
+	a.acmeMu.Lock()
+	defer a.acmeMu.Unlock()
+
+	var cfg TLSSettings
+	a.store.View(func(db *DB) { cfg = db.Settings.TLS })
+	if cfg.Domain == "" {
+		return errors.New("请先在「设置」中填写并保存域名")
+	}
 	if err := os.MkdirAll(a.certs.dir, 0o700); err != nil {
 		return err
 	}
-	if _, err := a.runAcme(t, script, nil, "--install-cert", "-d", cfg.Domain, "--ecc",
-		"--fullchain-file", a.certs.certFile(), "--key-file", a.certs.keyFile()); err != nil {
-		return fmt.Errorf("安装证书失败: %w", err)
+	if err := a.acmeObtain(t, cfg, cfg.Domain, force, a.certs.certFile(), a.certs.keyFile()); err != nil {
+		return err
 	}
 	_ = os.Chmod(a.certs.keyFile(), 0o600)
 	if err := a.certs.load(); err != nil {
@@ -260,11 +275,22 @@ func (a *App) renewLoop() {
 		info := a.certs.info()
 		var domain string
 		a.store.View(func(db *DB) { domain = db.Settings.TLS.Domain })
-		if !info.Loaded || domain == "" || time.Until(info.NotAfter) > 30*24*time.Hour {
-			continue
+		if info.Loaded && domain != "" && time.Until(info.NotAfter) < 30*24*time.Hour {
+			log.Printf("证书将于 %s 到期，开始自动续期", info.NotAfter.Format("2006-01-02"))
+			a.tasks.Start("自动续期证书："+domain, func(t *Task) error { return a.issueCert(t, true) })
 		}
-		log.Printf("证书将于 %s 到期，开始自动续期", info.NotAfter.Format("2006-01-02"))
-		a.tasks.Start("自动续期证书："+domain, func(t *Task) error { return a.issueCert(t, true) })
+		// 通过 acme.sh 申请的节点证书同样自动续期，并同步到节点。
+		for _, n := range a.store.Snapshot().Nodes {
+			if !n.TLSAuto || n.TLSCert == "" {
+				continue
+			}
+			leaf, err := certLeaf(n.TLSCert, n.TLSKey)
+			if err != nil || time.Until(leaf.NotAfter) > 30*24*time.Hour {
+				continue
+			}
+			id := n.ID
+			a.tasks.Start("自动续期节点证书：「"+n.Name+"」", func(t *Task) error { return a.issueNodeCert(t, id, true) })
+		}
 	}
 }
 
@@ -335,8 +361,9 @@ func (a *App) saveTLS(w http.ResponseWriter, r *http.Request) (any, error) {
 		return nil, bad("验证方式不正确")
 	case c.Mode == "dns" && !dnsProviderRe.MatchString(c.DNSProvider):
 		return nil, bad("DNS 服务商应为 acme.sh 的 dnsapi 名称，例如 dns_ali、dns_dp、dns_cf")
-	case c.AcmeBaseURL != "" && !strings.HasPrefix(c.AcmeBaseURL, "https://") && !strings.HasPrefix(c.AcmeBaseURL, "http://"):
-		return nil, bad("acme.sh 下载地址必须以 http(s):// 开头")
+	// 后台会执行从这里下载的脚本，不接受明文 HTTP。
+	case c.AcmeBaseURL != "" && !strings.HasPrefix(c.AcmeBaseURL, "https://"):
+		return nil, bad("acme.sh 下载地址必须以 https:// 开头")
 	}
 	var env map[string]string
 	if strings.TrimSpace(in.DNSEnvText) != "" {
@@ -350,6 +377,10 @@ func (a *App) saveTLS(w http.ResponseWriter, r *http.Request) (any, error) {
 			k, v = strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"'`)
 			if !ok || !envKeyRe.MatchString(k) {
 				return nil, bad("DNS API 凭据每行应为 KEY=VALUE：%s", line)
+			}
+			// 这些变量会改变 acme.sh 脚本自身的执行方式，不是 DNS 凭据。
+			if up := strings.ToUpper(k); reservedEnv[up] || strings.HasPrefix(up, "LD_") || strings.HasPrefix(up, "BASH_") || strings.HasPrefix(up, "LE_") {
+				return nil, bad("不允许设置环境变量 %s", k)
 			}
 			env[k] = v
 		}

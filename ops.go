@@ -428,6 +428,16 @@ for p in @PORTS@; do
     firewall-cmd -q --permanent --add-port="$p/tcp" && firewall-cmd -q --add-port="$p/tcp"
   fi
 done
+# 兼容旧版 VMess 客户端的开关通过 systemd 的环境变量传给 v2ray
+DROP=/etc/systemd/system/v2ray.service.d
+if [ -n "@LEGACY@" ]; then
+  mkdir -p "$DROP"
+  printf '[Service]\nEnvironment=V2RAY_VMESS_AEAD_FORCED=false\n' > "$DROP/vcw-legacy.conf"
+  systemctl daemon-reload
+elif [ -f "$DROP/vcw-legacy.conf" ]; then
+  rm -f "$DROP/vcw-legacy.conf"
+  systemctl daemon-reload
+fi
 restart_v2ray
 echo ">> 配置已生效"
 command -v logrotate >/dev/null 2>&1 || echo "注意：节点上没有安装 logrotate，/var/log/v2ray 下的日志不会自动清理，请留意磁盘空间"
@@ -642,6 +652,11 @@ func (a *App) applyOn(t *Task, conn *sshConn, nodeID string) error {
 		ps[i] = strconv.Itoa(p)
 	}
 	t.logf("同步配置到「%s」（监听端口: %s）", n.Name, strings.Join(ps, " "))
+	legacy := ""
+	if n.Conf.LegacyVMess {
+		legacy = "1"
+		t.logf("已开启旧版 VMess 兼容（不安全，建议尽快让用户改用 alterId 0）")
+	}
 	limits := nodeLimits(db, nodeID)
 	has := ""
 	if len(limits) > 0 {
@@ -649,7 +664,7 @@ func (a *App) applyOn(t *Task, conn *sshConn, nodeID string) error {
 		t.logf("下发 %d 条按用户限速规则", len(limits))
 	}
 	script := strings.NewReplacer("@CONFIG@", cfg, "@PORTS@", strings.Join(ps, " "),
-		"@HASLIMITS@", has, "@LIMITS@", limitsScript(limits)).Replace(applyScript)
+		"@HASLIMITS@", has, "@LIMITS@", limitsScript(limits), "@LEGACY@", legacy).Replace(applyScript)
 	if err := runRootScript(conn.Client, n, script, t, 2*time.Minute); err != nil {
 		return fmt.Errorf("同步配置失败: %w", err)
 	}

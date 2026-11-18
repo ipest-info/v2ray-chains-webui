@@ -77,7 +77,8 @@ function render() {
       <td><strong>${esc(n.name)}</strong></td>
       <td class="mono">${esc(n.ssh_user)}@${esc(n.ssh_host)}:${n.ssh_port}
         ${n.jump_node_id ? `<div class="muted">经「${esc(nodeName(n.jump_node_id))}」跳转</div>` : ''}</td>
-      <td class="mono">${esc(n.public_addr) || '<span class="muted">-</span>'}<div class="muted">${esc(n.internal_addr)}</div></td>
+      <td class="mono">${esc(n.public_addr) || '<span class="muted">-</span>'}<div class="muted">${esc(n.internal_addr)}</div>
+        ${n.tls_domain ? `<div>${esc(n.tls_domain)} <span class="badge ${n.tls_cert_ok ? 'ok' : 'warn'}">${n.tls_cert_ok ? 'TLS' : '无证书'}</span></div>` : ''}</td>
       <td>${st}${n.status === 'offline' ? `<div class="muted">${esc(n.status_msg)}</div>` : ''}</td>
       <td>${v2} ${n.dirty ? '<span class="badge warn">配置待同步</span>' : ''}</td>
       <td class="ops">
@@ -88,6 +89,7 @@ function render() {
         <button class="small" data-act="node-config" data-id="${n.id}">预览配置</button>
         <button class="small" data-act="node-backups" data-id="${n.id}">备份 / 恢复</button>
         <button class="small" data-act="node-diag" data-id="${n.id}">日志排查</button>
+        ${n.tls_domain ? `<button class="small" data-act="node-cert" data-id="${n.id}">${n.has_tls_cert ? '续期证书' : '申请证书'}</button>` : ''}
         ${n.has_limits ? `<button class="small" data-act="node-limits-clear" data-id="${n.id}">清除限速</button>` : ''}
         <button class="small" data-act="node-edit" data-id="${n.id}">编辑</button>
         ${n.has_host_key ? `<button class="small" data-act="node-hostkey" data-id="${n.id}">重置主机公钥</button>` : ''}
@@ -98,7 +100,7 @@ function render() {
   $('#chainRows').innerHTML = S.chains.map((c) => `<tr>
       <td><strong>${esc(c.name)}</strong></td>
       <td>用户 ${c.hops.map((h, i) => `→ ${i > 0 ? `<span class="badge">${h.addr === 'internal' ? '内网' : '公网'}</span> ` : ''}${esc(nodeName(h.node_id))}`).join(' ')} → ${c.exit_id ? `<span class="badge warn">${esc(exitName(c.exit_id))}</span> → ` : ''}互联网</td>
-      <td class="mono">${c.port}</td>
+      <td class="mono">${c.port} <span class="badge">${{ ws: 'WebSocket', wstls: 'WS + TLS' }[c.transport] || 'TCP'}</span></td>
       <td class="ops">
         <button class="small" data-act="chain-test" data-id="${c.id}">检测连通性</button>
         <button class="small" data-act="chain-edit" data-id="${c.id}">编辑</button>
@@ -539,11 +541,19 @@ function nodeDialog(n) {
         <label>公网地址<input name="public_addr" value="${esc(n.public_addr)}" placeholder="用户 / 上一跳经公网连接"></label>
         <label>内网地址<input name="internal_addr" value="${esc(n.internal_addr)}" placeholder="可选，专线内网 IP"></label>
       </div>
+    </fieldset>
+    <fieldset><legend>TLS 域名与证书（仅当该节点要作为 WebSocket + TLS 线路的入口时需要）</legend>
+      <label>域名（需解析到该节点的公网 IP）<input name="tls_domain" value="${esc(n.tls_domain)}" placeholder="例如 gz.example.com"></label>
+      <p class="hint">${n.has_tls_cert ? `当前证书${n.tls_cert_ok ? '有效' : '<strong>无效或已过期</strong>'}，${esc(new Date(n.tls_not_after).toLocaleDateString())} 到期，${n.tls_auto ? '由 acme.sh 自动续期' : '手动粘贴，到期前需要自己更换'}。` : '还没有证书。'}
+        保存域名后，在节点列表点「申请证书」（使用「设置」里配置的 DNS 验证）；或者在下面粘贴已有证书。</p>
+      <label>证书（PEM，含完整证书链；留空则不修改）<textarea name="tls_cert" class="mono" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
+      <label>私钥（PEM；留空则不修改）<textarea name="tls_key" class="mono" spellcheck="false" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
     </fieldset>`, async (f) => {
     const body = {
       name: f.name.value, ssh_host: f.ssh_host.value, ssh_port: +f.ssh_port.value, ssh_user: f.ssh_user.value,
       ssh_password: f.ssh_password.value, ssh_key: f.ssh_key.value, clear_key: !!(f.clear_key && f.clear_key.checked),
       jump_node_id: f.jump_node_id.value, public_addr: f.public_addr.value, internal_addr: f.internal_addr.value,
+      tls_domain: f.tls_domain.value, tls_cert: f.tls_cert.value.trim(), tls_key: f.tls_key.value.trim(),
     };
     const r = await api(edit ? 'PUT' : 'POST', '/api/nodes' + (edit ? '/' + n.id : ''), body);
     // 保存后立即检测一次连通性，失败只提示不阻止保存。
@@ -567,6 +577,7 @@ function confDialog(n) {
     <label class="check"><input type="checkbox" name="sniffing" ${c.sniffing ? 'checked' : ''}>开启流量嗅探（从 HTTP / TLS 中识别域名）</label>
     <label class="check"><input type="checkbox" name="allow_private" ${c.allow_private ? 'checked' : ''}>作为出口时允许访问私有地址段（默认禁止，防止用户访问节点内网）</label>
     <label class="check"><input type="checkbox" name="no_access_log" ${c.no_access_log ? 'checked' : ''}>不写访问日志（默认每个连接记一条到 /var/log/v2ray/access.log；错误日志始终写入 error.log）</label>
+    <label class="check"><input type="checkbox" name="legacy_vmess" ${c.legacy_vmess ? 'checked' : ''}>兼容旧版 VMess 客户端（alterId 不为 0 的老配置；<strong>不安全</strong>，仅在用户暂时无法更新客户端配置时开启）</label>
     <label style="margin-top:12px">自定义 JSON（高级，可选）
       <textarea name="extra" class="code" spellcheck="false" placeholder='{"policy": {...}, "inbounds": [...], "outbounds": [...], "routing": {"rules": [...]}}'>${esc(c.extra)}</textarea></label>
     <p class="hint">合并规则：<code>inbounds</code> / <code>outbounds</code> 追加在线路生成的配置之后；<code>routing.rules</code> 插在最前面优先匹配；其它顶层字段（如 <code>policy</code>、<code>dns</code>、<code>log</code>）整体覆盖。保存后用「预览配置」查看结果，再「同步配置」下发。</p>`,
@@ -574,7 +585,7 @@ function confDialog(n) {
     await api('PUT', `/api/nodes/${n.id}/conf`, {
       log_level: f.log_level.value,
       dns: f.dns.value.split(/[,，\s]+/).filter(Boolean),
-      sniffing: f.sniffing.checked, allow_private: f.allow_private.checked, no_access_log: f.no_access_log.checked, extra: f.extra.value,
+      sniffing: f.sniffing.checked, allow_private: f.allow_private.checked, no_access_log: f.no_access_log.checked, legacy_vmess: f.legacy_vmess.checked, extra: f.extra.value,
     });
   });
 }
@@ -732,6 +743,13 @@ function chainDialog(c) {
       <div id="hops"></div>
       <button type="button" class="small" id="addHop">+ 添加下一跳</button>
     </fieldset>
+    <label>传输方式
+      <select name="transport">
+        <option value="tcp">TCP（默认）</option>
+        <option value="ws" ${c && c.transport === 'ws' ? 'selected' : ''}>WebSocket</option>
+        <option value="wstls" ${c && c.transport === 'wstls' ? 'selected' : ''}>WebSocket + TLS（入口节点需要先配置域名和证书）</option>
+      </select></label>
+    <p class="hint">传输方式对整条线路生效，各节点和用户链接会自动保持一致。修改后需要同步全部配置，<strong>用户也必须更新订阅或重新导入链接</strong>。WebSocket + TLS 时用户通过入口节点的域名连接；节点之间使用后台生成的自签证书。</p>
     <label>最终出口
       <select name="exit_id"><option value="">从最后一个节点直接出网</option>
         ${S.exits.map((x) => `<option value="${x.id}" ${c && c.exit_id === x.id ? 'selected' : ''}>经出口代理「${esc(x.name)}」</option>`).join('')}</select></label>
@@ -742,7 +760,7 @@ function chainDialog(c) {
       </select></label>
     <p class="hint">「内网 / 公网」表示上一跳通过哪个地址连接该节点，例如广州 → 香港走专线内网，香港 → 新加坡走公网。请在云厂商安全组中放行对应端口。</p>`,
   async (f) => {
-    await api(edit ? 'PUT' : 'POST', '/api/chains' + (edit ? '/' + c.id : ''), { name: f.name.value, port: +f.port.value, hops, exit_id: f.exit_id.value, udp_fallback: f.udp_fallback.value });
+    await api(edit ? 'PUT' : 'POST', '/api/chains' + (edit ? '/' + c.id : ''), { name: f.name.value, port: +f.port.value, hops, exit_id: f.exit_id.value, udp_fallback: f.udp_fallback.value, transport: f.transport.value });
   });
   const draw = () => {
     $('#hops').innerHTML = hops.map((h, i) => `<div class="hop">
@@ -857,6 +875,7 @@ document.addEventListener('click', async (e) => {
       case 'node-conf': return confDialog(node);
       case 'node-backups': return backupsDialog(node);
       case 'node-diag': return diagDialog(node);
+      case 'node-cert': return startTask(`/api/nodes/${id}/cert`);
       case 'node-limits-clear':
         if (confirm(`立即清除「${node.name}」上的全部限速规则？被限速的用户将暂时不受限，直到下次同步配置。`)) await startTask(`/api/nodes/${id}/limits/clear`);
         return;
