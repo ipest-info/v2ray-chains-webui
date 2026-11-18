@@ -20,11 +20,13 @@
 
 <div id="app" class="hidden">
   <header>
-    <strong>V2Ray 线路管理</strong>
+    <strong>V2Ray 线路管理</strong> <span id="version" class="muted"></span>
     <nav id="tabs">
       <a data-tab="nodes" class="active">节点</a>
       <a data-tab="chains">线路</a>
+      <a data-tab="exits">出口代理</a>
       <a data-tab="users">用户</a>
+      <a data-tab="bandwidth">带宽监控</a>
       <a data-tab="tasks">任务日志</a>
       <a data-tab="settings">设置</a>
     </nav>
@@ -36,6 +38,24 @@
 
   <main>
     <section id="tab-nodes">
+      <details id="guide" class="card guide">
+        <summary><strong>使用教程</strong><span id="guideProgress" class="muted"></span></summary>
+        <ol id="guideSteps"></ol>
+        <div class="guide-tips">
+          <strong>常用操作</strong>
+          <ul>
+            <li><b>后台连不上某个节点</b>：编辑该节点，在「SSH 跳板」里选一个能连到它的节点（例如广州连不上新加坡，就选「经香港跳转」），「SSH 地址」填跳板能访问到的地址。</li>
+            <li><b>改了任何东西都要同步</b>：修改线路、用户、出口代理或节点配置项后，节点会显示「配置待同步」，点右上角「同步全部配置」才会生效。</li>
+            <li><b>同步后出问题</b>：节点的「备份 / 恢复」里有每次同步前自动保存的配置，可以一键恢复。</li>
+            <li><b>让某个用户换出口</b>：编辑用户，在「最终出口」里选一个出口代理，其它用户不受影响。</li>
+            <li><b>出口代理的 UDP</b>：在「出口代理」页点「检测 UDP」。代理不支持时，编辑线路选择把 UDP 丢弃，还是改从最后一个节点直接出网。</li>
+            <li><b>用户连不上或速度异常</b>：从入口节点开始，逐个点节点的「日志排查」，它会检查服务状态、端口、配置、时间，并解释日志里的常见报错。「带宽监控」页可以看各节点网卡的实时速率。</li>
+            <li><b>给用户限速</b>：编辑用户填写上下行限速（Mbit/s）后同步。首次开启会给该用户换一个专属端口，需要让用户更新订阅，并在入口节点安全组放行该端口。</li>
+            <li><b>节点连不通</b>：线路页点「检测连通性」逐跳检查；最常见的原因是云厂商安全组没有放行线路端口。</li>
+            <li><b>某个节点需要特殊设置</b>：节点的「配置项」可以改日志级别、DNS，或追加自定义 JSON；「预览配置」查看最终下发的内容。</li>
+          </ul>
+        </div>
+      </details>
       <div class="bar">
         <h2>节点</h2>
         <button class="primary" data-act="node-new">添加节点</button>
@@ -59,15 +79,57 @@
       </table></div>
     </section>
 
+    <section id="tab-exits" class="hidden">
+      <div class="bar">
+        <h2>出口代理</h2>
+        <span><button data-act="exit-udp-all">检测全部 UDP</button>
+        <button data-act="exit-import">批量导入</button>
+        <button class="primary" data-act="exit-new">添加出口代理</button></span>
+      </div>
+      <p class="hint">出口代理是线路末端节点之后的最后一站（SOCKS5 / HTTP 代理）。可以设为某条线路的默认出口，也可以单独指定给某个用户。
+        UDP 只有 SOCKS5 代理可能支持：点「检测 UDP」会在线路的末端节点上实际发包验证；不支持时，UDP 按线路里的设置丢弃或改从末端节点直连。</p>
+      <div class="tablewrap"><table>
+        <thead><tr><th>名称</th><th>协议</th><th>地址</th><th>认证</th><th>UDP</th><th>使用情况</th><th>操作</th></tr></thead>
+        <tbody id="exitRows"></tbody>
+      </table></div>
+    </section>
+
     <section id="tab-users" class="hidden">
       <div class="bar">
         <h2>用户</h2>
         <button class="primary" data-act="user-new">添加用户</button>
       </div>
       <div class="tablewrap"><table>
-        <thead><tr><th>用户名</th><th>状态</th><th>可用线路</th><th>备注</th><th>操作</th></tr></thead>
+        <thead><tr><th>用户名</th><th>状态</th><th>可用线路</th><th>出口</th><th>限速</th><th>备注</th><th>操作</th></tr></thead>
         <tbody id="userRows"></tbody>
       </table></div>
+    </section>
+
+    <section id="tab-bandwidth" class="hidden">
+      <div class="bar">
+        <h2>带宽监控</h2>
+        <div class="seg" id="bwRange">
+          <button data-range="1h" class="active">1 小时</button>
+          <button data-range="24h">24 小时</button>
+          <button data-range="7d">7 天</button>
+        </div>
+      </div>
+      <p class="hint">各节点网卡的实时上下行速率，每 5 秒采样一次（24 小时视图为 1 分钟平均，7 天视图为 10 分钟平均）。统计的是整台服务器的网卡流量，不只是 v2ray；数据保存在后台内存中，后台重启后重新累积。</p>
+      <div class="card bw" id="bwUsers">
+        <div class="bw-head"><h3>用户流量</h3>
+          <div class="stat"><i style="background:var(--series-rx)"></i>下行（当前）<b data-k="rx">-</b></div>
+          <div class="stat"><i style="background:var(--series-tx)"></i>上行（当前）<b data-k="tx">-</b></div>
+          <div class="stat">区间下行流量<b data-k="rxb">-</b></div>
+          <div class="stat">区间上行流量<b data-k="txb">-</b></div>
+          <select aria-label="用户"></select></div>
+        <div class="bw-chart"></div>
+        <div class="tablewrap" style="margin-top:12px"><table>
+          <thead><tr><th>用户</th><th>当前下行</th><th>当前上行</th><th>区间下行流量</th><th>区间上行流量</th><th></th></tr></thead>
+          <tbody id="bwUserRows"></tbody></table></div>
+        <p class="hint" style="margin:10px 0 0">按用户的流量在线路的入口节点上统计（下行 = 发给用户，上行 = 用户发出）。同一用户走多条线路时合并计算。</p>
+      </div>
+      <h3 style="margin:24px 0 12px">节点网卡</h3>
+      <div id="bwNodes"></div>
     </section>
 
     <section id="tab-tasks" class="hidden">
@@ -81,6 +143,32 @@
 
     <section id="tab-settings" class="hidden">
       <div class="bar"><h2>设置</h2></div>
+      <form id="tlsForm" class="card narrow">
+        <h3>后台域名与 HTTPS 证书（acme.sh）</h3>
+        <p id="tlsStatus"></p>
+        <label>域名（需已解析到本机公网 IP）<input name="domain" placeholder="panel.example.com"></label>
+        <div class="row">
+          <label>邮箱（可选，ZeroSSL 必填）<input name="email" type="email" placeholder="you@example.com"></label>
+          <label>证书颁发机构<select name="ca">
+            <option value="letsencrypt">Let's Encrypt</option>
+            <option value="zerossl">ZeroSSL</option>
+            <option value="letsencrypt_test">Let's Encrypt 测试环境</option></select></label>
+        </div>
+        <label>域名验证方式<select name="mode">
+          <option value="http">HTTP 验证（申请时临时监听本机 80 端口）</option>
+          <option value="dns">DNS 验证（通过 DNS 服务商 API，不需要 80 端口）</option></select></label>
+        <div id="tlsDns" class="hidden">
+          <label>DNS 服务商（acme.sh 的 dnsapi 名称，如 <code>dns_ali</code> 阿里云、<code>dns_dp</code> DNSPod、<code>dns_cf</code> Cloudflare）
+            <input name="dns_provider" placeholder="dns_ali"></label>
+          <label>DNS API 凭据（每行一个 <code>KEY=VALUE</code>）<span id="tlsEnvKeys"></span>
+            <textarea name="dns_env_text" class="mono" spellcheck="false" placeholder="Ali_Key=xxxx&#10;Ali_Secret=xxxx"></textarea></label>
+        </div>
+        <label class="check"><input type="checkbox" name="redirect">证书可用后，把 HTTP 访问自动跳转到 HTTPS</label>
+        <label style="margin-top:12px">acme.sh 下载地址（首次申请时自动下载，访问不了 GitHub 时可换镜像）<input name="acme_base_url"></label>
+        <p class="hint">境内服务器的 80 端口对未备案域名通常不通，请选 DNS 验证。证书到期前 30 天自动续期。</p>
+        <button class="primary" type="submit">保存</button>
+        <button type="button" id="tlsIssue">申请 / 续期证书</button>
+      </form>
       <form id="settingsForm" class="card narrow">
         <h3>v2ray 下载地址</h3>
         <label>安装包地址（<code>{arch}</code> 会替换为 <code>64</code> 或 <code>arm64-v8a</code>）

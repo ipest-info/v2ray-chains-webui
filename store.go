@@ -32,7 +32,60 @@ type Node struct {
 	CheckedAt     time.Time `json:"checked_at"`
 	AppliedHash   string    `json:"applied_hash"`
 	AppliedAt     time.Time `json:"applied_at"`
+
+	Conf NodeConf `json:"conf"`
+
+	// 节点作为 WebSocket + TLS 线路入口时使用的域名和证书。
+	TLSDomain string `json:"tls_domain"`
+	TLSCert   string `json:"tls_cert,omitempty"`
+	TLSKey    string `json:"tls_key,omitempty"`
+	TLSAuto   bool   `json:"tls_auto"` // 证书由 acme.sh 申请（自动续期），否则为手动粘贴
 }
+
+// NodeConf 是单个节点的 v2ray 配置项。
+type NodeConf struct {
+	LogLevel     string   `json:"log_level"`     // debug / info / warning / error / none，默认 warning
+	DNS          []string `json:"dns"`           // 自定义 DNS 服务器，为空使用系统 DNS
+	Sniffing     bool     `json:"sniffing"`      // 入站流量嗅探（http / tls）
+	AllowPrivate bool     `json:"allow_private"` // 作为出口时允许访问私有地址段
+	NoAccessLog  bool     `json:"no_access_log"` // 不写访问日志（默认每个连接记一条）
+	LegacyVMess  bool     `json:"legacy_vmess"`  // 接受旧版（非 AEAD，alterId 不为 0）VMess 客户端，不安全
+	Extra        string   `json:"extra"`         // 追加 / 覆盖的自定义 JSON
+}
+
+// Exit 是最终出口代理：线路最后一个节点把流量再转交给它（socks / http）。
+type Exit struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"` // socks / http
+	Address  string `json:"address"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password,omitempty"`
+
+	// UDP 处理方式：auto（默认，SOCKS5 且未检测出不支持时经代理转发）/ proxy（强制经代理）/ off（不经代理）。
+	UDP          string    `json:"udp"`
+	UDPStatus    string    `json:"udp_status"` // 最近一次检测结果：ok / fail / error / 空（未检测）
+	UDPMsg       string    `json:"udp_msg"`
+	UDPCheckedAt time.Time `json:"udp_checked_at"`
+}
+
+// udpViaProxy 返回该出口的 UDP 流量是否交给代理转发。HTTP 代理无法承载 UDP。
+func (e *Exit) udpViaProxy() bool {
+	if e.Protocol != "socks" {
+		return false
+	}
+	switch e.UDP {
+	case "proxy":
+		return true
+	case "off":
+		return false
+	}
+	return e.UDPStatus != "fail"
+}
+
+// exitDirect 用在 User.ExitID 上，表示强制从线路末端节点直接出网。
+const exitDirect = "direct"
 
 // Hop 是线路中的一跳。Addr 表示「上一跳如何访问本跳」：public 或 internal。
 type Hop struct {
@@ -46,19 +99,33 @@ type Chain struct {
 	Name      string `json:"name"`
 	Port      int    `json:"port"` // 线路在每个节点上使用的端口
 	Hops      []Hop  `json:"hops"`
-	RelayUUID string `json:"relay_uuid"` // 节点之间互联使用的凭据
+	RelayUUID string `json:"relay_uuid,omitempty"` // 节点之间互联使用的凭据
+
+	Transport string `json:"transport"`            // tcp（默认）/ ws / wstls
+	WSPath    string `json:"ws_path"`              // WebSocket 路径
+	RelayCert string `json:"relay_cert,omitempty"` // wstls 时节点互联用的自签证书
+	RelayKey  string `json:"relay_key,omitempty"`
+	ExitID    string `json:"exit_id"` // 默认出口代理，为空表示从末端节点直接出网
+	// 出口代理不转发 UDP 时，本线路上 UDP 的处理：block（默认，丢弃）/ direct（从末端节点直接出网）。
+	UDPFallback string `json:"udp_fallback"`
 }
 
 // User 是一个代理账号。
 type User struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	UUID      string    `json:"uuid"`
-	SubToken  string    `json:"sub_token"`
-	Enabled   bool      `json:"enabled"`
-	ChainIDs  []string  `json:"chain_ids"` // 为空表示可使用全部线路
-	Remark    string    `json:"remark"`
-	CreatedAt time.Time `json:"created_at"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	UUID     string   `json:"uuid"`
+	SubToken string   `json:"sub_token"`
+	Enabled  bool     `json:"enabled"`
+	ChainIDs []string `json:"chain_ids"` // 为空表示可使用全部线路
+	ExitID   string   `json:"exit_id"`   // 为空跟随线路；direct 表示末端节点直连；否则为指定出口代理
+
+	// 限速（Mbit/s，0 表示不限）。限速用户在每条线路上使用专属端口：线路 ID -> 端口。
+	LimitDown float64        `json:"limit_down"`
+	LimitUp   float64        `json:"limit_up"`
+	Ports     map[string]int `json:"ports,omitempty"`
+	Remark    string         `json:"remark"`
+	CreatedAt time.Time      `json:"created_at"`
 }
 
 type Admin struct {
@@ -67,7 +134,8 @@ type Admin struct {
 }
 
 type Settings struct {
-	DownloadURL string `json:"download_url"`
+	DownloadURL string      `json:"download_url"`
+	TLS         TLSSettings `json:"tls"`
 }
 
 const defaultDownloadURL = "https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-{arch}.zip"
@@ -77,6 +145,7 @@ type DB struct {
 	Settings Settings `json:"settings"`
 	Nodes    []*Node  `json:"nodes"`
 	Chains   []*Chain `json:"chains"`
+	Exits    []*Exit  `json:"exits"`
 	Users    []*User  `json:"users"`
 }
 
@@ -118,14 +187,30 @@ func (s *Store) saveLocked() error {
 	return os.Rename(tmp, s.path)
 }
 
-// Update 在持锁状态下修改数据并落盘；fn 返回错误时不保存。
+// Update 修改数据并落盘。fn 在数据的副本上操作：返回错误时副本被丢弃，
+// 已做的部分修改不会留在内存里；成功且写盘成功后才替换当前数据。
 func (s *Store) Update(fn func(db *DB) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := fn(&s.db); err != nil {
+	b, err := json.Marshal(&s.db)
+	if err != nil {
 		return err
 	}
-	return s.saveLocked()
+	var next DB
+	if err := json.Unmarshal(b, &next); err != nil {
+		return err
+	}
+	if err := fn(&next); err != nil {
+		return err
+	}
+	ensureLimitPorts(&next)
+	prev := s.db
+	s.db = next
+	if err := s.saveLocked(); err != nil {
+		s.db = prev
+		return err
+	}
+	return nil
 }
 
 // View 在持锁状态下只读访问数据。
@@ -158,6 +243,15 @@ func (db *DB) chain(id string) *Chain {
 	for _, c := range db.Chains {
 		if c.ID == id {
 			return c
+		}
+	}
+	return nil
+}
+
+func (db *DB) exit(id string) *Exit {
+	for _, e := range db.Exits {
+		if e.ID == id {
+			return e
 		}
 	}
 	return nil

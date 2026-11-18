@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -8,8 +9,10 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +23,12 @@ type App struct {
 	store *Store
 	auth  *Auth
 	tasks *Tasks
+
+	dataDir   string
+	certs     *certManager
+	httpsPort string // HTTPS 监听端口，空表示未启用
+	acmeMu    sync.Mutex
+	monitor   *Monitor
 }
 
 type apiError struct {
@@ -62,15 +71,33 @@ func readJSON(r *http.Request, v any) error {
 type handler func(w http.ResponseWriter, r *http.Request) (any, error)
 
 // api 包装需要登录的接口。
+// checkWrite 对写操作做跨站请求伪造防护（会话 Cookie 本身已是 SameSite=Strict，这里是第二、三道）：
+// 必须是 JSON 请求（浏览器的跨站表单发不出来），且带 Origin 头时必须与当前站点一致。
+func checkWrite(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
+	}
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		writeJSON(w, http.StatusUnsupportedMediaType, obj{"error": "需要 application/json"})
+		return false
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			writeJSON(w, http.StatusForbidden, obj{"error": "请求来源不被允许"})
+			return false
+		}
+	}
+	return true
+}
+
 func (a *App) api(h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !a.auth.valid(r) {
 			writeJSON(w, http.StatusUnauthorized, obj{"error": "未登录"})
 			return
 		}
-		// 写操作必须是 JSON 请求，配合 SameSite=Strict Cookie 防止跨站请求伪造。
-		if r.Method != http.MethodGet && !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-			writeJSON(w, http.StatusUnsupportedMediaType, obj{"error": "需要 application/json"})
+		if !checkWrite(w, r) {
 			return
 		}
 		v, err := h(w, r)
@@ -97,6 +124,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /api/state", a.api(a.state))
 	mux.HandleFunc("POST /api/password", a.api(a.changePassword))
 	mux.HandleFunc("PUT /api/settings", a.api(a.saveSettings))
+	mux.HandleFunc("PUT /api/tls", a.api(a.saveTLS))
+	mux.HandleFunc("POST /api/tls/issue", a.api(a.tlsIssue))
 
 	mux.HandleFunc("POST /api/nodes", a.api(a.saveNode))
 	mux.HandleFunc("PUT /api/nodes/{id}", a.api(a.saveNode))
@@ -106,7 +135,22 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/nodes/{id}/apply", a.api(a.nodeApply))
 	mux.HandleFunc("POST /api/nodes/{id}/reset-hostkey", a.api(a.nodeResetHostKey))
 	mux.HandleFunc("GET /api/nodes/{id}/config", a.api(a.nodeConfig))
+	mux.HandleFunc("GET /api/nodes/{id}/diagnose", a.api(a.nodeDiagnose))
+	mux.HandleFunc("POST /api/nodes/{id}/limits/clear", a.api(a.nodeClearLimits))
+	mux.HandleFunc("POST /api/nodes/{id}/cert", a.api(a.nodeCert))
 	mux.HandleFunc("POST /api/apply-all", a.api(a.applyAll))
+	mux.HandleFunc("PUT /api/nodes/{id}/conf", a.api(a.saveNodeConf))
+	mux.HandleFunc("GET /api/nodes/{id}/backups", a.api(a.backupList))
+	mux.HandleFunc("POST /api/nodes/{id}/backups", a.api(a.backupCreate))
+	mux.HandleFunc("GET /api/nodes/{id}/backups/{name}", a.api(a.backupGet))
+	mux.HandleFunc("POST /api/nodes/{id}/backups/{name}/restore", a.api(a.backupRestore))
+
+	mux.HandleFunc("POST /api/exits", a.api(a.saveExit))
+	mux.HandleFunc("POST /api/exits/import", a.api(a.importExits))
+	mux.HandleFunc("POST /api/exits/udp-test", a.api(a.exitUDPTest))
+	mux.HandleFunc("POST /api/exits/{id}/udp-test", a.api(a.exitUDPTest))
+	mux.HandleFunc("PUT /api/exits/{id}", a.api(a.saveExit))
+	mux.HandleFunc("DELETE /api/exits/{id}", a.api(a.deleteExit))
 
 	mux.HandleFunc("POST /api/chains", a.api(a.saveChain))
 	mux.HandleFunc("PUT /api/chains/{id}", a.api(a.saveChain))
@@ -119,11 +163,21 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/users/{id}/reset", a.api(a.resetUser))
 
 	mux.HandleFunc("GET /api/tasks/{id}", a.api(a.taskGet))
+	mux.HandleFunc("GET /api/bandwidth", a.api(a.bandwidth))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		// 页面只加载自身的脚本和样式，不允许内联脚本；即使某处转义遗漏，注入的脚本也不会执行。
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "+
+				"object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
+		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/sub/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		mux.ServeHTTP(w, r)
 	})
 }
@@ -131,6 +185,9 @@ func (a *App) routes() http.Handler {
 // ---------- 登录 ----------
 
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
+	if !checkWrite(w, r) {
+		return
+	}
 	ip := clientIP(r)
 	if a.auth.locked(ip) {
 		writeJSON(w, http.StatusTooManyRequests, obj{"error": "登录失败次数过多，请 10 分钟后再试"})
@@ -144,7 +201,8 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	var admin Admin
 	a.store.View(func(db *DB) { admin = db.Admin })
 	okPw := checkPassword(admin.PasswordHash, in.Password) // 始终校验，避免用户名探测
-	if in.Username != admin.Username || !okPw {
+	okUser := subtle.ConstantTimeCompare([]byte(in.Username), []byte(admin.Username)) == 1
+	if !okUser || !okPw {
 		a.auth.recordFail(ip)
 		time.Sleep(500 * time.Millisecond)
 		writeJSON(w, http.StatusUnauthorized, obj{"error": "用户名或密码错误"})
@@ -156,6 +214,9 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) logout(w http.ResponseWriter, r *http.Request) {
+	if !checkWrite(w, r) {
+		return
+	}
 	a.auth.drop(r)
 	setSessionCookie(w, r, "", -1)
 	writeJSON(w, http.StatusOK, obj{"ok": true})
@@ -192,7 +253,9 @@ func (a *App) changePassword(w http.ResponseWriter, r *http.Request) (any, error
 }
 
 func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) (any, error) {
-	var in Settings
+	var in struct {
+		DownloadURL string `json:"download_url"`
+	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
 	}
@@ -200,10 +263,11 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) (any, error) 
 	if in.DownloadURL == "" {
 		in.DownloadURL = defaultDownloadURL
 	}
-	if !strings.HasPrefix(in.DownloadURL, "https://") && !strings.HasPrefix(in.DownloadURL, "http://") {
-		return nil, bad("下载地址必须以 http(s):// 开头")
+	// 节点会以 root 身份安装从这里下载的程序，不接受明文 HTTP。
+	if !strings.HasPrefix(in.DownloadURL, "https://") {
+		return nil, bad("下载地址必须以 https:// 开头")
 	}
-	return nil, a.store.Update(func(db *DB) error { db.Settings = in; return nil })
+	return nil, a.store.Update(func(db *DB) error { db.Settings.DownloadURL = in.DownloadURL; return nil })
 }
 
 // ---------- 总览 ----------
@@ -214,6 +278,17 @@ type nodeView struct {
 	HasKey      bool `json:"has_key"`
 	HasHostKey  bool `json:"has_host_key"`
 	Dirty       bool `json:"dirty"`
+	HasLimits   bool `json:"has_limits"`
+
+	HasTLSCert  bool      `json:"has_tls_cert"`
+	TLSCertOK   bool      `json:"tls_cert_ok"`
+	TLSNotAfter time.Time `json:"tls_not_after"`
+}
+
+type exitView struct {
+	Exit
+	HasPassword bool `json:"has_password"`
+	UDPViaProxy bool `json:"udp_via_proxy"`
 }
 
 type userView struct {
@@ -227,16 +302,32 @@ func (a *App) state(w http.ResponseWriter, r *http.Request) (any, error) {
 	for _, n := range db.Nodes {
 		cfg, ports := configJSON(db, n.ID)
 		v := nodeView{Node: *n, HasPassword: n.SSHPassword != "", HasKey: n.SSHKey != "", HasHostKey: n.HostKey != ""}
-		v.Dirty = n.AppliedHash != configHash(cfg) && (n.AppliedHash != "" || len(ports) > 0)
-		v.SSHPassword, v.SSHKey, v.HostKey = "", "", ""
+		v.Dirty = n.AppliedHash != nodeHash(db, n.ID) && (n.AppliedHash != "" || len(ports) > 0)
+		v.HasLimits = len(nodeLimits(db, n.ID)) > 0
+		_ = cfg
+		if n.TLSCert != "" {
+			v.HasTLSCert, v.TLSCertOK = true, nodeCertOK(n)
+			if leaf, err := certLeaf(n.TLSCert, n.TLSKey); err == nil {
+				v.TLSNotAfter = leaf.NotAfter
+			}
+		}
+		// 凭据、私钥一律不出后台
+		v.SSHPassword, v.SSHKey, v.HostKey, v.TLSCert, v.TLSKey = "", "", "", "", ""
 		nodes = append(nodes, v)
 	}
 	users := make([]userView, 0, len(db.Users))
 	for _, u := range db.Users {
 		v := userView{User: *u, Links: []obj{}}
+		if v.ChainIDs == nil {
+			v.ChainIDs = []string{}
+		}
 		for _, c := range db.Chains {
 			if userAllowed(u, c.ID) {
-				v.Links = append(v.Links, obj{"chain_id": c.ID, "name": chainPath(db, c), "link": vmessLink(db, u, c)})
+				exit := "末端节点直连"
+				if e := db.exit(userExit(db, u, c)); e != nil {
+					exit = e.Name
+				}
+				v.Links = append(v.Links, obj{"chain_id": c.ID, "name": chainPath(db, c), "exit": exit, "link": vmessLink(db, u, c)})
 			}
 		}
 		users = append(users, v)
@@ -244,11 +335,25 @@ func (a *App) state(w http.ResponseWriter, r *http.Request) (any, error) {
 	if db.Chains == nil {
 		db.Chains = []*Chain{}
 	}
+	// 线路的互联凭据和自签私钥只用于生成节点配置，页面不需要。
+	chains := db.Chains
+	for _, c := range chains {
+		c.RelayUUID, c.RelayCert, c.RelayKey = "", "", ""
+	}
+	exits := make([]exitView, 0, len(db.Exits))
+	for _, e := range db.Exits {
+		v := exitView{Exit: *e, HasPassword: e.Password != "", UDPViaProxy: e.udpViaProxy()}
+		v.Password = ""
+		exits = append(exits, v)
+	}
 	return obj{
 		"admin":    db.Admin.Username,
-		"settings": db.Settings,
+		"version":  version,
+		"settings": obj{"download_url": db.Settings.DownloadURL},
+		"tls":      a.tlsState(db.Settings.TLS),
 		"nodes":    nodes,
-		"chains":   db.Chains,
+		"chains":   chains,
+		"exits":    exits,
 		"users":    users,
 		"tasks":    a.tasks.List(),
 	}, nil
@@ -270,6 +375,9 @@ type nodeInput struct {
 	JumpNodeID   string `json:"jump_node_id"`
 	PublicAddr   string `json:"public_addr"`
 	InternalAddr string `json:"internal_addr"`
+	TLSDomain    string `json:"tls_domain"`
+	TLSCert      string `json:"tls_cert"` // 手动粘贴证书；与 tls_key 一起留空表示保持不变
+	TLSKey       string `json:"tls_key"`
 }
 
 func (a *App) saveNode(w http.ResponseWriter, r *http.Request) (any, error) {
@@ -283,6 +391,7 @@ func (a *App) saveNode(w http.ResponseWriter, r *http.Request) (any, error) {
 	in.SSHUser = strings.TrimSpace(in.SSHUser)
 	in.PublicAddr = strings.TrimSpace(in.PublicAddr)
 	in.InternalAddr = strings.TrimSpace(in.InternalAddr)
+	in.TLSDomain = strings.ToLower(strings.TrimSpace(in.TLSDomain))
 	if in.SSHUser == "" {
 		in.SSHUser = "root"
 	}
@@ -302,6 +411,8 @@ func (a *App) saveNode(w http.ResponseWriter, r *http.Request) (any, error) {
 		return nil, bad("公网地址格式不正确")
 	case in.InternalAddr != "" && !addrRe.MatchString(in.InternalAddr):
 		return nil, bad("内网地址格式不正确")
+	case in.TLSDomain != "" && !domainRe.MatchString(in.TLSDomain):
+		return nil, bad("TLS 域名格式不正确")
 	}
 
 	var out string
@@ -328,8 +439,36 @@ func (a *App) saveNode(w http.ResponseWriter, r *http.Request) (any, error) {
 				cur = db.node(cur).JumpNodeID
 			}
 		}
+		// 连接目标变了却沿用已保存的凭据，等于把密码发给新地址：必须重新填写。
+		targetChanged := id != "" && (n.SSHHost != in.SSHHost || n.SSHPort != in.SSHPort || n.SSHUser != in.SSHUser)
+		if targetChanged && in.SSHPassword == "" && strings.TrimSpace(in.SSHKey) == "" {
+			return bad("修改了 SSH 地址、端口或用户名，请重新填写密码或私钥")
+		}
+		if targetChanged {
+			n.SSHPassword, n.SSHKey = "", ""
+		}
 		if n.SSHHost != in.SSHHost || n.SSHPort != in.SSHPort {
 			n.HostKey = "" // 换了服务器，重新记录主机公钥
+		}
+		// TLS 域名与证书（用于 WebSocket + TLS 线路的入口）
+		if in.TLSCert != "" || in.TLSKey != "" {
+			leaf, err := certLeaf(in.TLSCert, in.TLSKey)
+			if err != nil {
+				return bad("证书和私钥无法解析或不匹配: %v", err)
+			}
+			if in.TLSDomain == "" || leaf.VerifyHostname(in.TLSDomain) != nil {
+				return bad("证书不包含域名 %s", in.TLSDomain)
+			}
+			if time.Now().After(leaf.NotAfter) {
+				return bad("证书已过期")
+			}
+			n.TLSCert, n.TLSKey, n.TLSAuto = strings.TrimSpace(in.TLSCert)+"\n", strings.TrimSpace(in.TLSKey)+"\n", false
+		} else if in.TLSDomain != n.TLSDomain {
+			n.TLSCert, n.TLSKey, n.TLSAuto = "", "", false // 换了域名，旧证书作废
+		}
+		n.TLSDomain = in.TLSDomain
+		if c := wstlsEntryChain(db, n.ID); c != nil && !nodeCertOK(n) {
+			return bad("线路「%s」以该节点作为 WebSocket + TLS 入口，必须保留有效的域名和证书", c.Name)
 		}
 		n.Name, n.SSHHost, n.SSHPort, n.SSHUser = in.Name, in.SSHHost, in.SSHPort, in.SSHUser
 		n.JumpNodeID, n.PublicAddr, n.InternalAddr = in.JumpNodeID, in.PublicAddr, in.InternalAddr
@@ -452,6 +591,16 @@ func (a *App) applyAll(w http.ResponseWriter, r *http.Request) (any, error) {
 	return obj{"task_id": t.ID}, nil
 }
 
+func (a *App) nodeClearLimits(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	name, err := a.nodeName(id)
+	if err != nil {
+		return nil, err
+	}
+	t := a.tasks.Start("清除限速规则：「"+name+"」", func(t *Task) error { return a.clearLimits(t, id) })
+	return obj{"task_id": t.ID}, nil
+}
+
 func (a *App) nodeResetHostKey(w http.ResponseWriter, r *http.Request) (any, error) {
 	id := r.PathValue("id")
 	return nil, a.store.Update(func(db *DB) error {
@@ -469,8 +618,180 @@ func (a *App) nodeConfig(w http.ResponseWriter, r *http.Request) (any, error) {
 	if db.node(r.PathValue("id")) == nil {
 		return nil, errNotFound
 	}
-	cfg, _ := configJSON(db, r.PathValue("id"))
-	return obj{"config": cfg}, nil
+	cfg, _ := buildConfig(db, r.PathValue("id"))
+	maskSecrets(cfg)
+	b, _ := json.MarshalIndent(cfg, "", "  ")
+	return obj{"config": string(b)}, nil
+}
+
+// ---------- 节点 v2ray 配置项与备份 ----------
+
+var logLevels = map[string]bool{"debug": true, "info": true, "warning": true, "error": true, "none": true}
+
+func (a *App) saveNodeConf(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	var in NodeConf
+	if err := readJSON(r, &in); err != nil {
+		return nil, err
+	}
+	if in.LogLevel == "" {
+		in.LogLevel = "warning"
+	}
+	if !logLevels[in.LogLevel] {
+		return nil, bad("日志级别不正确")
+	}
+	dns := []string{}
+	for _, d := range in.DNS {
+		if d = strings.TrimSpace(d); d == "" {
+			continue
+		}
+		if len(d) > 200 || strings.ContainsAny(d, " \t\r\n\"") {
+			return nil, bad("DNS 服务器格式不正确: %s", d)
+		}
+		dns = append(dns, d)
+	}
+	in.DNS = dns
+	in.Extra = strings.TrimSpace(in.Extra)
+	if _, err := parseExtra(in.Extra); err != nil {
+		return nil, bad("自定义 JSON %v", err)
+	}
+	return nil, a.store.Update(func(db *DB) error {
+		n := db.node(id)
+		if n == nil {
+			return errNotFound
+		}
+		n.Conf = in
+		return nil
+	})
+}
+
+func (a *App) backupList(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	if _, err := a.nodeName(id); err != nil {
+		return nil, err
+	}
+	list, err := a.listBackups(id)
+	if err != nil {
+		return nil, bad("%v", err)
+	}
+	return obj{"backups": list}, nil
+}
+
+func (a *App) backupGet(w http.ResponseWriter, r *http.Request) (any, error) {
+	id, name := r.PathValue("id"), r.PathValue("name")
+	if _, err := a.nodeName(id); err != nil {
+		return nil, err
+	}
+	if !backupNameRe.MatchString(name) {
+		return nil, bad("备份文件名不正确")
+	}
+	content, err := a.readBackup(id, name)
+	if err != nil {
+		return nil, bad("%v", err)
+	}
+	return obj{"config": content}, nil
+}
+
+func (a *App) backupCreate(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	name, err := a.nodeName(id)
+	if err != nil {
+		return nil, err
+	}
+	t := a.tasks.Start("备份配置：「"+name+"」", func(t *Task) error { return a.backupNode(t, id) })
+	return obj{"task_id": t.ID}, nil
+}
+
+func (a *App) backupRestore(w http.ResponseWriter, r *http.Request) (any, error) {
+	id, file := r.PathValue("id"), r.PathValue("name")
+	name, err := a.nodeName(id)
+	if err != nil {
+		return nil, err
+	}
+	if !backupNameRe.MatchString(file) {
+		return nil, bad("备份文件名不正确")
+	}
+	t := a.tasks.Start("恢复备份：「"+name+"」", func(t *Task) error { return a.restoreNode(t, id, file) })
+	return obj{"task_id": t.ID}, nil
+}
+
+// ---------- 出口代理 ----------
+
+func (a *App) saveExit(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	var in Exit
+	if err := readJSON(r, &in); err != nil {
+		return nil, err
+	}
+	in.Name, in.Address, in.Username = strings.TrimSpace(in.Name), strings.TrimSpace(in.Address), strings.TrimSpace(in.Username)
+	switch {
+	case in.Name == "":
+		return nil, bad("请填写出口名称")
+	case in.Protocol != "socks" && in.Protocol != "http":
+		return nil, bad("协议只支持 socks 或 http")
+	case !addrRe.MatchString(in.Address):
+		return nil, bad("代理地址格式不正确")
+	case in.Port < 1 || in.Port > 65535:
+		return nil, bad("端口范围 1-65535")
+	case in.UDP != "" && in.UDP != "auto" && in.UDP != "proxy" && in.UDP != "off":
+		return nil, bad("UDP 处理方式不正确")
+	case in.UDP == "proxy" && in.Protocol != "socks":
+		return nil, bad("HTTP 代理无法转发 UDP")
+	}
+	if in.UDP == "" {
+		in.UDP = "auto"
+	}
+	return nil, a.store.Update(func(db *DB) error {
+		var e *Exit
+		if id == "" {
+			e = &Exit{ID: randHex(4)}
+			db.Exits = append(db.Exits, e)
+		} else if e = db.exit(id); e == nil {
+			return errNotFound
+		}
+		// 代理地址变了却沿用已保存的密码，等于把密码发给新地址：必须重新填写。
+		if id != "" && e.Password != "" && in.Username != "" && in.Password == "" &&
+			(e.Protocol != in.Protocol || e.Address != in.Address || e.Port != in.Port) {
+			return bad("修改了代理的协议、地址或端口，请重新填写密码")
+		}
+		// 换了代理服务器后，之前的 UDP 检测结果不再适用。
+		if e.Protocol != in.Protocol || e.Address != in.Address || e.Port != in.Port || e.Username != in.Username {
+			e.UDPStatus, e.UDPMsg, e.UDPCheckedAt = "", "", time.Time{}
+		}
+		e.Name, e.Protocol, e.Address, e.Port, e.UDP = in.Name, in.Protocol, in.Address, in.Port, in.UDP
+		// 密码留空表示保持不变；用户名清空则一并清除密码。
+		if in.Password != "" {
+			e.Password = in.Password
+		}
+		if in.Username == "" {
+			e.Password = ""
+		}
+		e.Username = in.Username
+		return nil
+	})
+}
+
+func (a *App) deleteExit(w http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	return nil, a.store.Update(func(db *DB) error {
+		for _, c := range db.Chains {
+			if c.ExitID == id {
+				return bad("线路「%s」正在使用该出口，请先修改", c.Name)
+			}
+		}
+		for _, u := range db.Users {
+			if u.ExitID == id {
+				return bad("用户「%s」正在使用该出口，请先修改", u.Name)
+			}
+		}
+		for i, e := range db.Exits {
+			if e.ID == id {
+				db.Exits = append(db.Exits[:i], db.Exits[i+1:]...)
+				return nil
+			}
+		}
+		return errNotFound
+	})
 }
 
 // ---------- 线路 ----------
@@ -478,9 +799,12 @@ func (a *App) nodeConfig(w http.ResponseWriter, r *http.Request) (any, error) {
 func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 	id := r.PathValue("id")
 	var in struct {
-		Name string `json:"name"`
-		Port int    `json:"port"`
-		Hops []Hop  `json:"hops"`
+		Name        string `json:"name"`
+		Port        int    `json:"port"`
+		Hops        []Hop  `json:"hops"`
+		ExitID      string `json:"exit_id"`
+		UDPFallback string `json:"udp_fallback"`
+		Transport   string `json:"transport"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
@@ -495,8 +819,13 @@ func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 		return nil, bad("线路至少需要一个节点")
 	case len(in.Hops) > 8:
 		return nil, bad("线路最多 8 跳")
+	case in.Transport != "" && in.Transport != "tcp" && in.Transport != "ws" && in.Transport != "wstls":
+		return nil, bad("传输方式不正确")
 	}
 	return nil, a.store.Update(func(db *DB) error {
+		if in.ExitID != "" && db.exit(in.ExitID) == nil {
+			return bad("所选出口代理不存在")
+		}
 		seen := map[string]bool{}
 		for i := range in.Hops {
 			h := &in.Hops[i]
@@ -521,6 +850,13 @@ func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 		if entry := db.node(in.Hops[0].NodeID); entry.PublicAddr == "" {
 			return bad("入口节点「%s」未填写公网地址，用户无法连接", entry.Name)
 		}
+		for _, u := range db.Users {
+			for _, p := range u.Ports {
+				if p == in.Port {
+					return bad("端口 %d 已分配为用户「%s」的限速专属端口，请换一个", in.Port, u.Name)
+				}
+			}
+		}
 		for _, c := range db.Chains {
 			if c.ID == id || c.Port != in.Port {
 				continue
@@ -533,12 +869,35 @@ func (a *App) saveChain(w http.ResponseWriter, r *http.Request) (any, error) {
 		}
 		var c *Chain
 		if id == "" {
-			c = &Chain{ID: randHex(4), RelayUUID: newUUID()}
+			c = &Chain{ID: randHex(4), RelayUUID: newUUID(), WSPath: "/" + randHex(8)}
 			db.Chains = append(db.Chains, c)
 		} else if c = db.chain(id); c == nil {
 			return errNotFound
 		}
-		c.Name, c.Port, c.Hops = in.Name, in.Port, in.Hops
+		c.Name, c.Port, c.Hops, c.ExitID = in.Name, in.Port, in.Hops, in.ExitID
+		c.Transport = "tcp"
+		if in.Transport == "ws" || in.Transport == "wstls" {
+			c.Transport = in.Transport
+		}
+		if c.WSPath == "" {
+			c.WSPath = "/" + randHex(8)
+		}
+		if c.Transport == "wstls" {
+			if entry := db.node(in.Hops[0].NodeID); !nodeCertOK(entry) {
+				return bad("WebSocket + TLS 需要入口节点「%s」先配置 TLS 域名和有效证书（编辑节点填写域名，再点「申请证书」或粘贴证书）", entry.Name)
+			}
+			if c.RelayCert == "" {
+				cert, key, err := selfSignedCert("relay-" + c.ID + ".internal")
+				if err != nil {
+					return err
+				}
+				c.RelayCert, c.RelayKey = cert, key
+			}
+		}
+		c.UDPFallback = "block"
+		if in.UDPFallback == "direct" {
+			c.UDPFallback = "direct"
+		}
 		return nil
 	})
 }
@@ -589,10 +948,13 @@ func (a *App) chainTest(w http.ResponseWriter, r *http.Request) (any, error) {
 func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 	id := r.PathValue("id")
 	var in struct {
-		Name     string   `json:"name"`
-		Enabled  bool     `json:"enabled"`
-		ChainIDs []string `json:"chain_ids"`
-		Remark   string   `json:"remark"`
+		Name      string   `json:"name"`
+		Enabled   bool     `json:"enabled"`
+		ChainIDs  []string `json:"chain_ids"`
+		Remark    string   `json:"remark"`
+		ExitID    string   `json:"exit_id"`
+		LimitDown float64  `json:"limit_down"`
+		LimitUp   float64  `json:"limit_up"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
@@ -601,11 +963,20 @@ func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 	if in.Name == "" || len(in.Name) > 64 {
 		return nil, bad("请填写用户名（最多 64 个字符）")
 	}
+	for _, v := range []float64{in.LimitDown, in.LimitUp} {
+		// 低于 0.1 Mbit/s 的限速会让连接几乎不可用，高于 10 Gbit/s 没有意义。
+		if v != 0 && (v < 0.1 || v > 10000) {
+			return nil, bad("限速范围 0.1 - 10000 Mbit/s，0 表示不限")
+		}
+	}
 	return nil, a.store.Update(func(db *DB) error {
 		for _, u := range db.Users {
 			if u.Name == in.Name && u.ID != id {
 				return bad("用户名已存在")
 			}
+		}
+		if in.ExitID != "" && in.ExitID != exitDirect && db.exit(in.ExitID) == nil {
+			return bad("所选出口代理不存在")
 		}
 		for _, cid := range in.ChainIDs {
 			if db.chain(cid) == nil {
@@ -623,6 +994,8 @@ func (a *App) saveUser(w http.ResponseWriter, r *http.Request) (any, error) {
 			in.ChainIDs = []string{}
 		}
 		u.Name, u.Enabled, u.ChainIDs, u.Remark = in.Name, in.Enabled, in.ChainIDs, strings.TrimSpace(in.Remark)
+		u.ExitID = in.ExitID
+		u.LimitDown, u.LimitUp = in.LimitDown, in.LimitUp
 		return nil
 	})
 }

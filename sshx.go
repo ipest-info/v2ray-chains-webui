@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -166,6 +167,17 @@ func dialVia(jc *ssh.Client, addr string) (net.Conn, error) {
 	}
 }
 
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
 // runSession 执行一条命令，超时后强制断开。
 func runSession(c *ssh.Client, cmd string, stdin io.Reader, out io.Writer, timeout time.Duration) error {
 	sess, err := c.NewSession()
@@ -173,9 +185,11 @@ func runSession(c *ssh.Client, cmd string, stdin io.Reader, out io.Writer, timeo
 		return err
 	}
 	defer sess.Close()
+	// 标准输出和错误输出由两个 goroutine 同时写入同一个目标，必须加锁串行化。
+	w := &lockedWriter{w: out}
 	sess.Stdin = stdin
-	sess.Stdout = out
-	sess.Stderr = out
+	sess.Stdout = w
+	sess.Stderr = w
 	done := make(chan error, 1)
 	go func() { done <- sess.Run(cmd) }()
 	select {

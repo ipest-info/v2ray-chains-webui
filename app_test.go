@@ -6,9 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -76,6 +80,98 @@ func TestBuildConfigNoUsers(t *testing.T) {
 	}
 	if _, ports := configJSON(db, "hk"); len(ports) != 1 {
 		t.Errorf("中转节点仍应监听: %v", ports)
+	}
+}
+
+// 用户级出口：dave 指定走 socks 出口，alice 跟随线路默认（末端直连）。
+func TestPerUserExit(t *testing.T) {
+	db := testDB()
+	db.Exits = []*Exit{{ID: "e1", Name: "住宅代理", Protocol: "socks", Address: "9.9.9.9", Port: 1080, Username: "u", Password: "p"}}
+	db.Users = append(db.Users, &User{ID: "u4", Name: "dave", UUID: "dave-uuid", Enabled: true, ExitID: "e1"})
+	exitRelay, exitEmail := relayID(db.Chains[0], "e1")
+
+	rulesOf := func(node string) []any {
+		cfg, _ := buildConfig(db, node)
+		return cfg["routing"].(obj)["rules"].([]any)
+	}
+	find := func(rules []any, user string) string {
+		for _, r := range rules {
+			r := r.(obj)
+			if r["outboundTag"] == "api" {
+				continue // 统计接口自身的规则
+			}
+			us, _ := r["user"].([]string)
+			if (user == "" && us == nil && r["ip"] == nil) || (len(us) == 1 && us[0] == user) {
+				return r["outboundTag"].(string)
+			}
+		}
+		return ""
+	}
+
+	// 入口：dave 走带出口标记的出站，其余用户走默认出站。
+	gz := rulesOf("gz")
+	if find(gz, "dave") != "out-c1-e1" || find(gz, "") != "out-c1" {
+		t.Errorf("入口规则不正确: %v", gz)
+	}
+	gzJSON, _ := configJSON(db, "gz")
+	if !strings.Contains(gzJSON, exitRelay) || !strings.Contains(gzJSON, "relay-uuid") {
+		t.Errorf("入口应同时带有两种互联凭据:\n%s", gzJSON)
+	}
+
+	// 中转：按互联凭据分流。
+	hk := rulesOf("hk")
+	if find(hk, exitEmail) != "out-c1-e1" || find(hk, "") != "out-c1" {
+		t.Errorf("中转规则不正确: %v", hk)
+	}
+
+	// 出口：带标记的走 socks 代理，其余直连。
+	sg := rulesOf("sg")
+	if find(sg, exitEmail) != "exit-e1" || find(sg, "") != "direct" {
+		t.Errorf("出口规则不正确: %v", sg)
+	}
+	sgJSON, _ := configJSON(db, "sg")
+	if !strings.Contains(sgJSON, `"protocol": "socks"`) || !strings.Contains(sgJSON, `"address": "9.9.9.9"`) {
+		t.Errorf("出口节点缺少 socks 出站:\n%s", sgJSON)
+	}
+
+	// 线路默认出口改为代理、alice 强制直连：两者对调。
+	db.Chains[0].ExitID = "e1"
+	db.Users[3].ExitID = ""
+	db.Users[0].ExitID = exitDirect
+	sg = rulesOf("sg")
+	if find(sg, "relay@c1") != "direct" || find(sg, "") != "exit-e1" {
+		t.Errorf("默认出口为代理时规则不正确: %v", sg)
+	}
+}
+
+func TestNodeConf(t *testing.T) {
+	db := testDB()
+	db.node("sg").Conf = NodeConf{
+		LogLevel: "info", DNS: []string{"8.8.8.8"}, Sniffing: true, AllowPrivate: true,
+		Extra: `{"policy":{"levels":{"0":{"connIdle":120}}},
+			"inbounds":[{"tag":"x-in","port":1234,"protocol":"socks"}],
+			"routing":{"rules":[{"type":"field","inboundTag":["x-in"],"outboundTag":"direct"}]}}`,
+	}
+	cfg, _ := buildConfig(db, "sg")
+	s, _ := configJSON(db, "sg")
+	if cfg["log"].(obj)["loglevel"] != "info" || cfg["dns"] == nil || cfg["policy"] == nil {
+		t.Errorf("配置项未生效:\n%s", s)
+	}
+	if strings.Contains(s, "geoip:private") || !strings.Contains(s, "destOverride") {
+		t.Errorf("AllowPrivate / Sniffing 未生效:\n%s", s)
+	}
+	if n := len(cfg["inbounds"].([]any)); n != 2 {
+		t.Errorf("自定义入站应追加在后面，共 %d 个", n)
+	}
+	rules := cfg["routing"].(obj)["rules"].([]any)
+	if tags := rules[0].(obj)["inboundTag"].([]any); tags[0] != "x-in" {
+		t.Errorf("自定义路由规则应排在最前: %v", rules)
+	}
+	if _, err := parseExtra(`{"inbounds":{}}`); err == nil {
+		t.Error("inbounds 不是数组时应报错")
+	}
+	if _, err := parseExtra(`[1]`); err == nil {
+		t.Error("不是对象时应报错")
 	}
 }
 
@@ -245,5 +341,462 @@ func TestJumpLoopRejected(t *testing.T) {
 	}}
 	if _, err := dialNode(db, "a"); err == nil {
 		t.Error("循环跳板应报错")
+	}
+}
+
+func TestParseExitLine(t *testing.T) {
+	ok := []struct {
+		line, def      string
+		proto, addr    string
+		port           int
+		user, pw, name string
+	}{
+		{"socks5://u:p@1.2.3.4:1080#美国01", "http", "socks", "1.2.3.4", 1080, "u", "p", "美国01"},
+		{"http://proxy.example.com:8080/", "socks", "http", "proxy.example.com", 8080, "", "", "proxy.example.com:8080"},
+		{"1.2.3.4:1080:user:pa:ss", "socks", "socks", "1.2.3.4", 1080, "user", "pa:ss", "1.2.3.4:1080"},
+		{"user:p@ss@1.2.3.4:3128 日本 02", "http", "http", "1.2.3.4", 3128, "user", "p@ss", "日本 02"},
+		{"1.2.3.4:1080", "socks", "socks", "1.2.3.4", 1080, "", "", "1.2.3.4:1080"},
+	}
+	for _, c := range ok {
+		e, err := parseExitLine(c.line, c.def)
+		if err != nil {
+			t.Errorf("%q: %v", c.line, err)
+			continue
+		}
+		if e.Protocol != c.proto || e.Address != c.addr || e.Port != c.port || e.Username != c.user || e.Password != c.pw || e.Name != c.name {
+			t.Errorf("%q => %+v", c.line, e)
+		}
+	}
+	for _, line := range []string{"1.2.3.4", "1.2.3.4:abc", "ss://x@1.2.3.4:1", "1.2.3.4:99999", "bad host:1080:u:p", ":p@1.2.3.4:1080"} {
+		if e, err := parseExitLine(line, "socks"); err == nil {
+			t.Errorf("%q 应当报错，却得到 %+v", line, e)
+		}
+	}
+}
+
+// 出口代理不转发 UDP 时，末端节点上应有单独的 UDP 规则，且排在该出口的普通规则之前。
+func TestExitUDPHandling(t *testing.T) {
+	db := testDB()
+	db.Exits = []*Exit{{ID: "e1", Name: "x", Protocol: "socks", Address: "9.9.9.9", Port: 1080}}
+	db.Chains[0].ExitID = "e1"
+	udpRule := func() obj {
+		cfg, _ := buildConfig(db, "sg")
+		rules := cfg["routing"].(obj)["rules"].([]any)
+		for i, r := range rules {
+			if r.(obj)["network"] == "udp" {
+				if next := rules[i+1].(obj); next["outboundTag"] != "exit-e1" {
+					t.Errorf("UDP 规则应紧挨在出口规则之前: %v", rules)
+				}
+				return r.(obj)
+			}
+		}
+		return nil
+	}
+	if r := udpRule(); r != nil {
+		t.Errorf("SOCKS5 未检测时应经代理转发 UDP，不应有单独规则: %v", r)
+	}
+	db.Exits[0].UDPStatus = "fail"
+	if r := udpRule(); r == nil || r["outboundTag"] != "block" {
+		t.Errorf("检测为不支持后应丢弃 UDP: %v", r)
+	}
+	db.Chains[0].UDPFallback = "direct"
+	if r := udpRule(); r == nil || r["outboundTag"] != "direct" {
+		t.Errorf("线路设为直连时 UDP 应从末端节点出网: %v", r)
+	}
+	db.Exits[0].UDP = "proxy"
+	if r := udpRule(); r != nil {
+		t.Errorf("强制经代理时不应有单独规则: %v", r)
+	}
+	db.Exits[0].UDP, db.Exits[0].UDPStatus = "off", "ok"
+	if r := udpRule(); r == nil {
+		t.Error("关闭后应有单独规则")
+	}
+	db.Exits[0].UDP, db.Exits[0].Protocol = "auto", "http"
+	if r := udpRule(); r == nil {
+		t.Error("HTTP 代理始终不转发 UDP")
+	}
+}
+
+func TestBandwidthSampling(t *testing.T) {
+	c := parseNetDev([]string{
+		"Inter-|   Receive                                                |  Transmit",
+		" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed",
+		"    lo: 1000 10 0 0 0 0 0 0 1000 10 0 0 0 0 0 0",
+		"  eth0: 5000000 100 0 0 0 0 0 0 2000000 50 0 0 0 0 0 0",
+	})
+	if c["eth0"] != [2]uint64{5000000, 2000000} || c["lo"] != [2]uint64{1000, 1000} || len(c) != 2 {
+		t.Fatalf("parseNetDev = %v", c)
+	}
+
+	m := newNodeMon("")
+	t0 := time.Unix(1_700_000_000, 0)
+	m.add(t0, 100, map[string][2]uint64{"eth0": {0, 0}, "lo": {0, 0}})
+	if len(m.tiers[0]) != 0 {
+		t.Fatal("第一次采样只应记录基准")
+	}
+	// 5 秒内收 625000 字节 = 1 Mbit/s，发 62500 字节 = 100 kbit/s
+	m.add(t0.Add(5*time.Second), 105, map[string][2]uint64{"eth0": {625000, 62500}, "lo": {999, 999}})
+	s := m.tiers[0][0]
+	if s.R["eth0"].Rx != 1e6 || s.R["eth0"].Tx != 1e5 {
+		t.Errorf("速率 = %+v", s.R["eth0"])
+	}
+	if total := pick(s, ""); total.Rx != 1e6 {
+		t.Errorf("合计不应包含 lo: %+v", total)
+	}
+	// 计数器回绕（节点重启）时跳过该网卡，不产生负值或尖峰
+	m.add(t0.Add(10*time.Second), 110, map[string][2]uint64{"eth0": {10, 10}, "lo": {2000, 2000}})
+	if _, ok := m.tiers[0][1].R["eth0"]; ok {
+		t.Error("计数器变小时不应计算速率")
+	}
+	// 跨过一分钟后，1 分钟档应得到上一分钟的平均值：两次采样，eth0 一次 1 Mbit/s、一次无数据
+	m.add(t0.Add(65*time.Second), 165, map[string][2]uint64{"eth0": {20, 20}, "lo": {3000, 3000}})
+	if len(m.tiers[1]) != 1 || m.tiers[1][0].R["eth0"].Rx != 5e5 {
+		t.Errorf("1 分钟聚合 = %+v", m.tiers[1])
+	}
+}
+
+func TestUserStats(t *testing.T) {
+	// 入口节点开启统计接口，中转 / 出口节点不开启。
+	db := testDB()
+	gz, _ := configJSON(db, "gz")
+	hk, _ := configJSON(db, "hk")
+	if !strings.Contains(gz, "StatsService") || !strings.Contains(gz, "statsUserUplink") || !strings.Contains(gz, `"port": 10085`) {
+		t.Errorf("入口节点应开启按用户统计:\n%s", gz)
+	}
+	if strings.Contains(hk, "StatsService") {
+		t.Error("非入口节点不应开启统计接口")
+	}
+	if _, ports := configJSON(db, "gz"); len(ports) != 1 {
+		t.Errorf("统计接口端口不应出现在需要放行的端口里: %v", ports)
+	}
+
+	got := parseUserStats(`{
+  "stat": [
+    {"name": "user>>>alice>>>traffic>>>downlink", "value": "5000"},
+    {"name": "user>>>alice>>>traffic>>>uplink", "value": "300"},
+    {"name": "user>>>bob>>>traffic>>>uplink"},
+    {"name": "inbound>>>api>>>traffic>>>uplink", "value": "9"}
+  ]
+}`)
+	if got["alice"] != [2]uint64{5000, 300} || got["bob"] != [2]uint64{0, 0} || len(got) != 2 {
+		t.Errorf("parseUserStats = %v", got)
+	}
+
+	// 两个入口节点上的同一用户应合并。
+	now := time.Now()
+	mk := func(down uint64) *nodeMon {
+		m := newNodeMon("")
+		m.users.add(now.Add(-5*time.Second), 100, map[string][2]uint64{"alice": {0, 0}})
+		m.users.add(now, 105, map[string][2]uint64{"alice": {down, 0}})
+		return m
+	}
+	users, points, reporting := userBandwidth(db, map[string]*nodeMon{"a": mk(625000), "b": mk(625000)}, 0, "")
+	if reporting != 2 || users[0].Name != "alice" || users[0].Rx != 2e6 || !users[0].Known {
+		t.Errorf("users = %+v reporting = %d", users, reporting)
+	}
+	var sum int64
+	for _, p := range points {
+		sum += p[1]
+	}
+	if sum != 2e6 {
+		t.Errorf("points = %v", points)
+	}
+	if _, points, _ = userBandwidth(db, map[string]*nodeMon{"a": mk(625000)}, 0, "bob"); len(points) != 1 || points[0][1] != 0 {
+		t.Errorf("没有流量的用户应得到 0 值曲线: %v", points)
+	}
+}
+
+func TestUserRateLimit(t *testing.T) {
+	db := testDB()
+	alice := db.Users[0]
+	db.Users = append(db.Users, &User{ID: "u9", Name: "erin", UUID: "erin-uuid", Enabled: true})
+	alice.LimitDown, alice.LimitUp = 10, 0.5
+	ensureLimitPorts(db)
+	port := alice.Ports["c1"]
+	if port < limitPortBase || len(db.Users[3].Ports) != 0 {
+		t.Fatalf("限速用户应分配专属端口: %v / %v", alice.Ports, db.Users[3].Ports)
+	}
+
+	// 入口节点：限速用户在专属端口的独立入站里，其余用户仍在线路端口；两者走同一套路由规则。
+	cfg, ports := buildConfig(db, "gz")
+	if len(ports) != 2 || ports[0] != 20001 || ports[1] != port {
+		t.Errorf("ports = %v", ports)
+	}
+	for _, in := range cfg["inbounds"].([]any) {
+		in := in.(obj)
+		if in["tag"] == "api" {
+			continue
+		}
+		clients := in["settings"].(obj)["clients"].([]any)
+		email := clients[0].(obj)["email"]
+		if (in["port"] == port) != (email == "alice") || len(clients) != 1 {
+			t.Errorf("入站 %v 的用户不正确: %v", in["port"], clients)
+		}
+	}
+	rules := cfg["routing"].(obj)["rules"].([]any)
+	if tags := rules[len(rules)-1].(obj)["inboundTag"].([]string); len(tags) != 2 {
+		t.Errorf("路由规则应同时覆盖线路入站和专属入站: %v", tags)
+	}
+	// 中转节点不受影响。
+	if _, ports := buildConfig(db, "hk"); len(ports) != 1 {
+		t.Errorf("中转节点不应监听专属端口: %v", ports)
+	}
+
+	// 分享链接使用专属端口。
+	raw, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(vmessLink(db, alice, db.Chains[0]), "vmess://"))
+	if !strings.Contains(string(raw), fmt.Sprintf(`"port":"%d"`, port)) {
+		t.Errorf("链接端口不正确: %s", raw)
+	}
+
+	// 限速规则只下发到入口节点；限速值变化会让节点变为「待同步」。
+	lim := nodeLimits(db, "gz")
+	if len(lim) != 1 || lim[0].Port != port || lim[0].DownKbit != 10000 || lim[0].UpKbit != 500 {
+		t.Errorf("limits = %+v", lim)
+	}
+	if len(nodeLimits(db, "hk")) != 0 {
+		t.Error("非入口节点不应有限速规则")
+	}
+	before := nodeHash(db, "gz")
+	alice.LimitDown = 20
+	if nodeHash(db, "gz") == before {
+		t.Error("修改限速值后指纹应变化")
+	}
+
+	// 取消限速后回到线路端口，但端口保留，再次开启时不变。
+	alice.LimitDown, alice.LimitUp = 0, 0
+	ensureLimitPorts(db)
+	if userPort(alice, db.Chains[0]) != 20001 || alice.Ports["c1"] != port {
+		t.Errorf("取消限速后: port=%d ports=%v", userPort(alice, db.Chains[0]), alice.Ports)
+	}
+	// 线路删除后回收端口。
+	db.Chains = nil
+	ensureLimitPorts(db)
+	if len(alice.Ports) != 0 {
+		t.Errorf("线路删除后应回收端口: %v", alice.Ports)
+	}
+}
+
+func TestLocalLogFiles(t *testing.T) {
+	db := testDB()
+	for _, id := range []string{"gz", "hk", "sg"} {
+		cfg, _ := buildConfig(db, id)
+		l := cfg["log"].(obj)
+		if l["error"] != "/var/log/v2ray/error.log" || l["access"] != "/var/log/v2ray/access.log" {
+			t.Errorf("%s 应把日志写到本地文件: %v", id, l)
+		}
+	}
+	db.node("hk").Conf.NoAccessLog = true
+	cfg, _ := buildConfig(db, "hk")
+	if l := cfg["log"].(obj); l["access"] != "none" || l["error"] == nil {
+		t.Errorf("关闭访问日志后: %v", l)
+	}
+}
+
+func TestTransportWSTLS(t *testing.T) {
+	db := testDB()
+	c := db.Chains[0]
+	cert, key, err := selfSignedCert("gz.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := db.node("gz")
+	gz.TLSDomain, gz.TLSCert, gz.TLSKey = "gz.example.com", cert, key
+	if !nodeCertOK(gz) {
+		t.Fatal("证书应有效")
+	}
+	gz.TLSDomain = "other.example.com"
+	if nodeCertOK(gz) {
+		t.Error("证书不含该域名时应判为无效")
+	}
+	gz.TLSDomain = "gz.example.com"
+
+	c.Transport, c.WSPath = "wstls", "/abc123"
+	c.RelayCert, c.RelayKey, _ = selfSignedCert("relay-c1.internal")
+
+	stream := func(node string, outbound bool) obj {
+		cfg, _ := buildConfig(db, node)
+		k := "inbounds"
+		if outbound {
+			k = "outbounds"
+		}
+		for _, x := range cfg[k].([]any) {
+			x := x.(obj)
+			if x["protocol"] == "vmess" {
+				return x["streamSettings"].(obj)
+			}
+		}
+		return nil
+	}
+	certOf := func(s obj) string {
+		return strings.Join(s["tlsSettings"].(obj)["certificates"].([]any)[0].(obj)["certificate"].([]string), "\n")
+	}
+	// 入口用节点的正式证书，中转 / 出口的入站用线路的自签证书；路径处处一致。
+	in := stream("gz", false)
+	if in["network"] != "ws" || in["security"] != "tls" || in["wsSettings"].(obj)["path"] != "/abc123" ||
+		certOf(in) != strings.TrimSpace(cert) {
+		t.Errorf("入口入站 = %v", in)
+	}
+	if hk := stream("hk", false); certOf(hk) != strings.TrimSpace(c.RelayCert) {
+		t.Error("中转入站应使用线路的自签证书")
+	}
+	out := stream("gz", true)
+	if out["network"] != "ws" || out["security"] != "tls" || out["wsSettings"].(obj)["path"] != "/abc123" ||
+		out["tlsSettings"].(obj)["allowInsecure"] != true {
+		t.Errorf("出站 = %v", out)
+	}
+
+	// 用户链接：通过域名连接并开启 TLS。
+	raw, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(vmessLink(db, db.Users[0], c), "vmess://"))
+	var v map[string]string
+	json.Unmarshal(raw, &v)
+	if v["net"] != "ws" || v["tls"] != "tls" || v["add"] != "gz.example.com" || v["sni"] != "gz.example.com" || v["path"] != "/abc123" {
+		t.Errorf("link = %v", v)
+	}
+
+	// 预览里不出现私钥。
+	cfg, _ := buildConfig(db, "gz")
+	maskSecrets(cfg)
+	b, _ := json.Marshal(cfg)
+	if strings.Contains(string(b), "PRIVATE KEY") {
+		t.Error("预览配置不应包含私钥")
+	}
+
+	// 纯 WebSocket：没有 TLS。
+	c.Transport = "ws"
+	if in := stream("gz", false); in["network"] != "ws" || in["security"] != nil {
+		t.Errorf("ws 入站 = %v", in)
+	}
+	// 默认仍是 TCP。
+	c.Transport = ""
+	if in := stream("gz", false); in["network"] != "tcp" {
+		t.Errorf("默认入站 = %v", in)
+	}
+}
+
+// 接口层面的安全约束。
+func TestAPISecurity(t *testing.T) {
+	store, _ := OpenStore(t.TempDir())
+	app := &App{store: store, auth: newAuth(), tasks: &Tasks{}, certs: &certManager{dir: t.TempDir()}, monitor: &Monitor{nodes: map[string]*nodeMon{}}}
+	store.Update(func(db *DB) error {
+		db.Admin = Admin{Username: "admin", PasswordHash: hashPassword("test-pass-123")}
+		return nil
+	})
+	srv := httptest.NewServer(app.routes())
+	defer srv.Close()
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	do := func(method, path, body string, hdr map[string]string) (int, string, http.Header) {
+		req, _ := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b), resp.Header
+	}
+
+	// 未登录时所有管理接口都拒绝。
+	for _, p := range []string{"/api/state", "/api/bandwidth", "/api/tasks/x", "/api/nodes/x/config", "/api/nodes/x/diagnose", "/api/nodes/x/backups"} {
+		if code, _, _ := do("GET", p, "", nil); code != 401 {
+			t.Errorf("GET %s 未登录应为 401，得到 %d", p, code)
+		}
+	}
+	for _, p := range []string{"/api/nodes", "/api/apply-all", "/api/exits/import", "/api/tls/issue", "/api/password"} {
+		if code, _, _ := do("POST", p, "{}", nil); code != 401 {
+			t.Errorf("POST %s 未登录应为 401，得到 %d", p, code)
+		}
+	}
+	// 跨站来源的登录请求被拒绝。
+	if code, _, _ := do("POST", "/api/login", `{"username":"admin","password":"test-pass-123"}`, map[string]string{"Origin": "https://evil.example"}); code != 403 {
+		t.Errorf("跨站登录应为 403，得到 %d", code)
+	}
+	code, _, hdr := do("POST", "/api/login", `{"username":"admin","password":"test-pass-123"}`, nil)
+	if code != 200 {
+		t.Fatalf("登录失败 %d", code)
+	}
+	if c := hdr.Get("Set-Cookie"); !strings.Contains(c, "HttpOnly") || !strings.Contains(c, "SameSite=Strict") {
+		t.Errorf("会话 Cookie 属性不完整: %s", c)
+	}
+	if csp := hdr.Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self'") || hdr.Get("X-Frame-Options") != "DENY" {
+		t.Errorf("缺少安全响应头: %v", hdr)
+	}
+	// 已登录：跨站来源、非 JSON 的写请求仍被拒绝。
+	if code, _, _ := do("POST", "/api/apply-all", "{}", map[string]string{"Origin": "https://evil.example"}); code != 403 {
+		t.Errorf("跨站写请求应为 403，得到 %d", code)
+	}
+	if code, _, _ := do("POST", "/api/apply-all", "", map[string]string{"Content-Type": "text/plain"}); code != 415 {
+		t.Errorf("非 JSON 写请求应为 415，得到 %d", code)
+	}
+	if code, _, _ := do("POST", "/api/apply-all", "{}", map[string]string{"Origin": srv.URL}); code != 200 {
+		t.Errorf("同源写请求应成功，得到 %d", code)
+	}
+
+	// 修改 SSH 目标地址时必须重新提供凭据，否则已保存的密码会被发往新地址。
+	_, body, _ := do("POST", "/api/nodes", `{"name":"n","ssh_host":"10.0.0.1","ssh_password":"secret-pw","public_addr":"1.2.3.4"}`, nil)
+	var created struct{ ID string }
+	json.Unmarshal([]byte(body), &created)
+	if code, body, _ := do("PUT", "/api/nodes/"+created.ID, `{"name":"n","ssh_host":"203.0.113.9","public_addr":"1.2.3.4"}`, nil); code != 400 {
+		t.Errorf("改地址不带凭据应被拒绝: %d %s", code, body)
+	}
+	if code, _, _ := do("PUT", "/api/nodes/"+created.ID, `{"name":"renamed","ssh_host":"10.0.0.1","public_addr":"1.2.3.4"}`, nil); code != 200 {
+		t.Errorf("不改地址时可以不带凭据: %d", code)
+	}
+	// 出口代理同理。
+	do("POST", "/api/exits", `{"name":"e","protocol":"socks","address":"10.0.0.2","port":1080,"username":"u","password":"proxy-pw"}`, nil)
+	eid := store.Snapshot().Exits[0].ID
+	if code, _, _ := do("PUT", "/api/exits/"+eid, `{"name":"e","protocol":"socks","address":"203.0.113.9","port":1080,"username":"u"}`, nil); code != 400 {
+		t.Errorf("改代理地址不带密码应被拒绝: %d", code)
+	}
+
+	// 任何接口都不返回已保存的凭据。
+	_, state, _ := do("GET", "/api/state", "", nil)
+	for _, secret := range []string{"secret-pw", "proxy-pw", "password_hash", "relay_uuid", "PRIVATE KEY"} {
+		if strings.Contains(state, secret) {
+			t.Errorf("/api/state 泄露了 %s", secret)
+		}
+	}
+	// 不能通过「DNS API 凭据」注入会改变脚本执行方式的环境变量；下载地址必须是 HTTPS。
+	for _, env := range []string{"LD_PRELOAD=/tmp/x.so", "PATH=/tmp", "BASH_ENV=/tmp/x"} {
+		if code, _, _ := do("PUT", "/api/tls", `{"domain":"p.example.com","mode":"dns","dns_provider":"dns_ali","dns_env_text":"`+env+`"}`, nil); code != 400 {
+			t.Errorf("环境变量 %s 应被拒绝: %d", env, code)
+		}
+	}
+	if code, _, _ := do("PUT", "/api/settings", `{"download_url":"http://example.com/v2ray-{arch}.zip"}`, nil); code != 400 {
+		t.Errorf("明文 HTTP 下载地址应被拒绝: %d", code)
+	}
+	// 退出后会话立即失效。
+	do("POST", "/api/logout", "{}", nil)
+	if code, _, _ := do("GET", "/api/state", "", nil); code != 401 {
+		t.Errorf("退出后应为 401，得到 %d", code)
+	}
+}
+
+// 保存请求在校验中途失败时，不能在内存里留下半成品数据。
+func TestStoreUpdateIsAtomic(t *testing.T) {
+	store, _ := OpenStore(t.TempDir())
+	err := store.Update(func(db *DB) error {
+		db.Chains = append(db.Chains, &Chain{ID: "half"})
+		db.Settings.DownloadURL = "changed"
+		return errors.New("validation failed")
+	})
+	if err == nil {
+		t.Fatal("应返回错误")
+	}
+	db := store.Snapshot()
+	if len(db.Chains) != 0 || db.Settings.DownloadURL == "changed" {
+		t.Errorf("失败的修改泄漏到了内存: %+v", db)
+	}
+	if err := store.Update(func(db *DB) error { db.Chains = append(db.Chains, &Chain{ID: "ok"}); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if db := store.Snapshot(); len(db.Chains) != 1 || db.Chains[0].ID != "ok" {
+		t.Errorf("成功的修改应保留: %+v", db.Chains)
 	}
 }
