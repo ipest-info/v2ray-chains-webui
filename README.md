@@ -80,7 +80,10 @@ bash install.sh uninstall
 
 ### 发布新版本
 
-推送形如 `v1.2.3` 的标签后，GitHub Actions 会自动测试、构建两个架构的安装包并创建 Release：
+GitHub Actions 的 Release 流程会自动测试、构建两个架构的安装包并创建 Release。两种触发方式任选其一：
+
+- 在仓库的 Actions 页面选择 **Release** → **Run workflow**，填写版本号（如 `v0.2.0`），会在所选分支的最新提交上创建该标签；
+- 或者推送标签：
 
 ```bash
 git tag v0.2.0 && git push origin v0.2.0

@@ -1,9 +1,20 @@
 name: Release
 
-# 推送形如 v1.2.3 的标签时：测试、构建各架构的安装包并发布到 GitHub Releases。
+# 测试、构建各架构的安装包并发布到 GitHub Releases。两种触发方式：
+#   1. 推送形如 v1.2.3 的标签；
+#   2. 在 Actions 页面手动运行本流程并填写版本号（会在当前提交上创建该标签）。
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，例如 v0.1.0"
+        required: true
+        type: string
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
 
 permissions:
   contents: write
@@ -13,6 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check version
+        run: |
+          echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "版本号格式应为 v1.2.3，得到: $VERSION"; exit 1; }
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -21,7 +35,6 @@ jobs:
       - name: Build
         env:
           CGO_ENABLED: "0"
-          VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p dist
           for arch in amd64 arm64; do
@@ -37,7 +50,6 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ github.ref_name }}
         run: |
           cat > notes.md <<NOTES
           ## 安装 / 升级
@@ -52,4 +64,4 @@ jobs:
           更多选项（指定密码、监听端口、离线安装包、下载加速）见 README 的「一键安装」一节。
 
           NOTES
-          gh release create "$VERSION" dist/* --title "$VERSION" --notes-file notes.md --generate-notes
+          gh release create "$VERSION" dist/* --target "$GITHUB_SHA" --title "$VERSION" --notes-file notes.md --generate-notes
