@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+// version 在发布构建时通过 -ldflags "-X main.version=v1.2.3" 写入。
+var version = "dev"
+
 func main() {
 	listen := flag.String("listen", ":8080", "监听地址")
 	dataDir := flag.String("data", "./data", "数据目录")
@@ -21,7 +24,12 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "手动指定 TLS 证书文件（可选，指定后 -listen 直接提供 HTTPS，且不启用 -https-listen）")
 	tlsKey := flag.String("tls-key", "", "TLS 私钥文件（可选）")
 	resetAdmin := flag.Bool("reset-admin", false, "重置管理员账号密码后退出（读取 ADMIN_USER / ADMIN_PASSWORD，未设置密码则随机生成）")
+	showVersion := flag.Bool("version", false, "显示版本号后退出")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	store, err := OpenStore(*dataDir)
 	if err != nil {
@@ -100,6 +108,6 @@ func main() {
 		log.Printf("HTTPS 入口: https://<域名>:%s （在「设置」中配置域名并申请证书后可用）", port)
 		srv.Handler = app.redirectHTTPS(handler)
 	}
-	log.Printf("管理后台已启动: http://%s", *listen)
+	log.Printf("管理后台 %s 已启动: http://%s", version, *listen)
 	log.Fatal(srv.ListenAndServe())
 }

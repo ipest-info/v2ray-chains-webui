@@ -6,7 +6,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -tags timetzdata -trimpath -ldflags="-s -w" -o /v2ray-chains-webui .
+ARG VERSION=dev
+RUN go build -tags timetzdata -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /v2ray-chains-webui .
 
 FROM alpine:3.20
 # acme.sh 申请证书需要 curl 和 openssl

@@ -43,6 +43,51 @@
 
 ## 部署
 
+### 一键安装（推荐）
+
+在要部署后台的服务器上用 root 执行：
+
+```bash
+curl -fsSL https://github.com/ipest-info/v2ray-chains-webui/releases/latest/download/install.sh | bash
+```
+
+脚本会下载与系统架构匹配的发布包（amd64 / arm64）、校验 SHA-256、安装到 `/opt/v2ray-chains-webui`、
+注册 systemd 服务并启动，最后显示访问地址和管理员账号密码。**再次执行同一条命令即为升级**，数据和管理员账号保持不变。
+
+常用选项（写在 `bash` 前面作为环境变量，例如 `curl ... | ADMIN_PASSWORD='xxx' bash`）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `VERSION` | 安装指定版本，例如 `v0.1.0`；默认最新发布版 |
+| `ADMIN_USER` / `ADMIN_PASSWORD` | 首次安装时的管理员账号密码；不设置密码则随机生成并显示一次 |
+| `LISTEN` / `HTTPS_LISTEN` | 监听地址，默认 `:8080` / `:8443` |
+| `INSTALL_DIR` | 安装目录，默认 `/opt/v2ray-chains-webui` |
+| `GITHUB_PROXY` | 下载加速前缀（服务器访问 GitHub 困难时使用） |
+| `PKG` | 使用本地已下载的安装包，不联网下载 |
+| `GITHUB_TOKEN` | 仓库为私有时用于下载发布包的访问令牌 |
+
+服务器访问不了 GitHub 时，可以在别处从发布页下载 `install.sh` 和对应架构的 `.tar.gz`，传到服务器后离线安装：
+
+```bash
+PKG=./v2ray-chains-webui_linux_amd64.tar.gz bash install.sh
+```
+
+卸载（保留数据目录）：
+
+```bash
+bash install.sh uninstall
+```
+
+### 发布新版本
+
+推送形如 `v1.2.3` 的标签后，GitHub Actions 会自动测试、构建两个架构的安装包并创建 Release：
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+### 手动编译
+
 需要 Go 1.24+ 编译（或在本地交叉编译后上传）：
 
 ```bash

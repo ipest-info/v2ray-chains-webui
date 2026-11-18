@@ -348,6 +348,7 @@ func (a *App) state(w http.ResponseWriter, r *http.Request) (any, error) {
 	}
 	return obj{
 		"admin":    db.Admin.Username,
+		"version":  version,
 		"settings": obj{"download_url": db.Settings.DownloadURL},
 		"tls":      a.tlsState(db.Settings.TLS),
 		"nodes":    nodes,

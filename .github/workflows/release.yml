@@ -1,0 +1,55 @@
+name: Release
+
+# 推送形如 v1.2.3 的标签时：测试、构建各架构的安装包并发布到 GitHub Releases。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            out="build/$arch"
+            mkdir -p "$out"
+            GOOS=linux GOARCH=$arch go build -tags timetzdata -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" -o "$out/v2ray-chains-webui" .
+            cp README.md install.sh "$out/"
+            tar -czf "dist/v2ray-chains-webui_linux_$arch.tar.gz" -C "$out" .
+          done
+          cp install.sh dist/install.sh
+          (cd dist && sha256sum *.tar.gz install.sh > sha256sums.txt)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          cat > notes.md <<NOTES
+          ## 安装 / 升级
+
+          在要部署后台的服务器上用 root 执行：
+
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/$VERSION/install.sh | bash
+          \`\`\`
+
+          首次安装会创建 systemd 服务并显示管理员账号密码；再次执行即为升级，数据保持不变。
+          更多选项（指定密码、监听端口、离线安装包、下载加速）见 README 的「一键安装」一节。
+
+          NOTES
+          gh release create "$VERSION" dist/* --title "$VERSION" --notes-file notes.md --generate-notes

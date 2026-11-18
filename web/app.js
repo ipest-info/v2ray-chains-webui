@@ -62,6 +62,7 @@ async function refresh() {
 
 function render() {
   $('#adminName').textContent = S.admin;
+  $('#version').textContent = S.version || '';
   const dirty = S.nodes.filter((n) => n.dirty).length;
   $('#dirtyCount').textContent = dirty;
   $('#dirtyCount').classList.toggle('hidden', !dirty);
